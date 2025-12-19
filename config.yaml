@@ -1,0 +1,59 @@
+# Polymarket-Opinion 套利系统配置文件
+
+# 市场映射表 - 手动配置相同赌局的token对应关系
+markets:
+  # 示例配置，需要替换为实际的token ID
+  - name: "示例市场"
+    enabled: false  # 设为true启用
+    polymarket:
+      condition_id: "0x..."
+      yes_token_id: "0x..."
+      no_token_id: "0x..."
+    opinion:
+      market_id: 0
+      yes_token_id: "0x..."
+      no_token_id: "0x..."
+
+# 套利参数
+arbitrage:
+  min_profit_threshold: 0.02     # 最小利润阈值 2%
+  max_position_size: 50          # 单次最大金额 $50
+  min_position_size: 10          # 单次最小金额 $10
+  max_unhedged_exposure: 50      # 单边敞口上限 $50
+  price_freshness_ms: 500        # 价格有效期 500ms
+  order_timeout_ms: 1000         # 订单超时 1000ms
+  aggressive_price_markup: 0.002 # Opinion下单溢价 0.2%
+
+# 费率配置
+fees:
+  polymarket:
+    taker_fee: 0.0               # Polymarket全球平台无taker fee
+    gas_estimate: 0.05           # Polygon gas ~$0.05
+  opinion:
+    taker_fee: 0.01              # Opinion交易费 1% (保守估计)
+    gas_estimate: 0.10           # BNB Chain gas ~$0.10
+
+# 监控配置
+monitoring:
+  opinion_poll_interval: 0.5     # Opinion轮询间隔 (秒)
+  log_level: INFO
+  log_to_file: true
+  log_file: "arbitrage.log"
+
+# 认证凭据 (建议使用环境变量覆盖，不要直接填写)
+credentials:
+  polymarket:
+    private_key: "${PM_PRIVATE_KEY}"
+    api_key: "${PM_API_KEY}"
+    api_secret: "${PM_API_SECRET}"
+    api_passphrase: "${PM_API_PASSPHRASE}"
+    proxy_address: "${PM_PROXY_ADDRESS}"
+  opinion:
+    api_key: "${OPINION_API_KEY}"
+    private_key: "${OPINION_PRIVATE_KEY}"
+
+# 代理配置 (Opinion地区限制)
+proxy:
+  enabled: false
+  http: "${HTTP_PROXY}"
+  https: "${HTTPS_PROXY}"
