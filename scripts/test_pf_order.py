@@ -15,7 +15,7 @@ from eth_account.messages import encode_defunct
 load_dotenv()
 
 
-async def get_jwt(client: httpx.AsyncClient, private_key: str, predict_account: str = None) -> str:
+async def get_jwt(client: httpx.AsyncClient, private_key: str) -> str:
     """获取 Predict.fun JWT token"""
 
     # 1. 获取签名消息
@@ -36,56 +36,31 @@ async def get_jwt(client: httpx.AsyncClient, private_key: str, predict_account: 
     account = Account.from_key(private_key)
     msg = encode_defunct(text=message)
     signed = account.sign_message(msg)
-    signature = signed.signature.hex()
-
-    # 确保签名以 0x 开头
-    if not signature.startswith("0x"):
-        signature = "0x" + signature
+    signature = "0x" + signed.signature.hex()
 
     print(f"签名钱包: {account.address}")
     print(f"签名: {signature[:40]}...")
 
-    # 3. 获取 JWT - 尝试不同的请求格式
-    auth_payloads = [
-        # 格式1: 使用 predict account 地址
-        {
-            "message": message,
-            "signature": signature,
-            "walletAddress": predict_account if predict_account else account.address,
-        },
-        # 格式2: 只用签名钱包地址
-        {
-            "message": message,
-            "signature": signature,
-            "walletAddress": account.address,
-        },
-        # 格式3: 添加 address 字段
-        {
-            "message": message,
-            "signature": signature,
-            "address": account.address,
-        },
-    ]
+    # 3. 获取 JWT - 字段名是 'signer' 不是 'walletAddress'
+    auth_payload = {
+        "message": message,
+        "signature": signature,
+        "signer": account.address,  # 关键: 字段名是 'signer'
+    }
 
-    for i, payload in enumerate(auth_payloads):
-        print(f"\n尝试认证格式 {i+1}: {list(payload.keys())}")
-        print(f"  walletAddress: {payload.get('walletAddress', payload.get('address', 'N/A'))}")
+    auth_resp = await client.post("/auth", json=auth_payload)
+    if auth_resp.status_code != 200:
+        print(f"认证失败: {auth_resp.status_code} - {auth_resp.text[:100]}")
+        return ""
 
-        auth_resp = await client.post("/auth", json=payload)
-        print(f"  响应: {auth_resp.status_code}")
+    auth_data = auth_resp.json()
+    if not auth_data.get("success"):
+        print(f"认证 API 错误: {auth_data}")
+        return ""
 
-        if auth_resp.status_code == 200:
-            auth_data = auth_resp.json()
-            if auth_data.get("success"):
-                jwt = auth_data["data"].get("token", "")
-                print(f"  JWT 获取成功!")
-                return jwt
-            else:
-                print(f"  API 错误: {auth_data.get('message', auth_data)}")
-        else:
-            print(f"  错误: {auth_resp.text[:100]}")
-
-    return ""
+    jwt = auth_data["data"].get("token", "")
+    print(f"JWT Token: {jwt[:40]}..." if jwt else "JWT Token: 获取失败")
+    return jwt
 
 
 async def main():
@@ -96,9 +71,6 @@ async def main():
     api_key = os.getenv("PREDICT_FUN_API_KEY", "")
     private_key = os.getenv("PM_PRIVATE_KEY", "")  # 使用 PM 私钥
 
-    # Predict 账户地址 (BNB 链上的资金地址)
-    predict_account = "0xe60eFb319e300c244Db089DEC83Bf3A12e9205e9"
-
     if not api_key:
         print("错误: PREDICT_FUN_API_KEY 未设置")
         return
@@ -107,8 +79,9 @@ async def main():
         print("错误: PM_PRIVATE_KEY 未设置")
         return
 
+    account = Account.from_key(private_key)
     print(f"API Key: {api_key[:8]}...{api_key[-4:]}")
-    print(f"Predict Account: {predict_account}")
+    print(f"钱包: {account.address}")
 
     base_url = "https://api.predict.fun/v1"
     headers = {"X-API-Key": api_key}
@@ -119,14 +92,10 @@ async def main():
         print("获取 JWT Token")
         print("=" * 60)
 
-        jwt = await get_jwt(client, private_key, predict_account)
+        jwt = await get_jwt(client, private_key)
 
         if not jwt:
             print("\n无法获取 JWT Token")
-            print("\n可能的原因:")
-            print("1. 签名钱包需要是 Predict.fun 的登录钱包")
-            print("2. 需要使用 Predict Account 的私钥签名")
-            print("3. 认证 API 参数格式不对")
             return
 
         # 添加 Authorization header
@@ -137,7 +106,7 @@ async def main():
         print("获取活跃市场")
         print("=" * 60)
 
-        resp = await client.get("/markets", params={"limit": 10})
+        resp = await client.get("/markets", params={"limit": 20})
         if resp.status_code != 200:
             print(f"获取市场失败: {resp.status_code}")
             return
@@ -162,6 +131,10 @@ async def main():
             print(f"当前开放订单: {len(orders_data.get('data', []))}")
         else:
             print(f"获取订单失败: {orders_resp.text[:100]}")
+
+        print("\n" + "=" * 60)
+        print("✅ 认证测试完成!")
+        print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -101,6 +101,7 @@ class OpinionCredentials:
 class PredictFunCredentials:
     """Predict.fun API credentials."""
     api_key: str = ""
+    private_key: str = ""
 
 
 @dataclass
@@ -270,6 +271,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
         ),
         predict_fun=PredictFunCredentials(
             api_key=pf_creds.get("api_key", ""),
+            private_key=pf_creds.get("private_key", ""),
         ),
     )
 

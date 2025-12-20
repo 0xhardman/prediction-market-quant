@@ -62,6 +62,7 @@ credentials:
     private_key: "${OPINION_PRIVATE_KEY}"
   predict_fun:
     api_key: "${PREDICT_FUN_API_KEY}"
+    private_key: "${PM_PRIVATE_KEY}"  # 使用 PM 钱包签名认证
 
 # 代理配置 (Opinion地区限制)
 proxy:

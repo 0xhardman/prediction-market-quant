@@ -5,6 +5,8 @@ from typing import Dict, Optional
 
 import httpx
 from aiolimiter import AsyncLimiter
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 from ..config import Config
 from ..models import Orderbook, OrderResult, OrderStatus, Platform, Side
@@ -30,11 +32,13 @@ class PredictFunClient(BaseClient):
         # HTTP client
         self._http_client: Optional[httpx.AsyncClient] = None
 
-        # API key
+        # Credentials
         self._api_key = config.credentials.predict_fun.api_key
+        self._private_key = config.credentials.predict_fun.private_key
+        self._jwt_token: Optional[str] = None
 
     async def connect(self) -> None:
-        """Initialize HTTP client."""
+        """Initialize HTTP client and authenticate."""
         headers = {}
         if self._api_key:
             headers["X-API-Key"] = self._api_key
@@ -44,7 +48,65 @@ class PredictFunClient(BaseClient):
             headers=headers,
             timeout=30,
         )
+
+        # Authenticate if private key is available
+        if self._private_key:
+            await self._authenticate()
+
         self.logger.info("Predict.fun client connected")
+
+    async def _authenticate(self) -> bool:
+        """Authenticate and get JWT token."""
+        if not self._private_key or not self._http_client:
+            return False
+
+        try:
+            # 1. Get auth message
+            resp = await self._http_client.get("/auth/message")
+            if resp.status_code != 200:
+                self.logger.error(f"Failed to get auth message: {resp.status_code}")
+                return False
+
+            data = resp.json()
+            if not data.get("success"):
+                self.logger.error(f"Auth message error: {data}")
+                return False
+
+            message = data["data"]["message"]
+
+            # 2. Sign message
+            account = Account.from_key(self._private_key)
+            msg = encode_defunct(text=message)
+            signed = account.sign_message(msg)
+            signature = "0x" + signed.signature.hex()
+
+            # 3. Get JWT - field name is 'signer', not 'walletAddress'
+            auth_resp = await self._http_client.post(
+                "/auth",
+                json={
+                    "message": message,
+                    "signature": signature,
+                    "signer": account.address,
+                },
+            )
+
+            if auth_resp.status_code != 200:
+                self.logger.error(f"Auth failed: {auth_resp.status_code}")
+                return False
+
+            auth_data = auth_resp.json()
+            if not auth_data.get("success"):
+                self.logger.error(f"Auth error: {auth_data}")
+                return False
+
+            self._jwt_token = auth_data["data"]["token"]
+            self._http_client.headers["Authorization"] = f"Bearer {self._jwt_token}"
+            self.logger.info(f"Authenticated as {account.address}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Authentication error: {e}")
+            return False
 
     async def disconnect(self) -> None:
         """Close HTTP client."""

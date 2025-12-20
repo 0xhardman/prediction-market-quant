@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""使用 predict-sdk 测试 Predict.fun 下单"""
+"""使用 predict-sdk 测试 Predict.fun 认证和市场查询"""
 
 import asyncio
 import os
@@ -11,37 +11,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import httpx
-from predict_sdk import OrderBuilder, ChainId, ADDRESSES_BY_CHAIN_ID, generate_order_salt, Side
-from predict_sdk.logger import get_logger
 from eth_account import Account
+from eth_account.messages import encode_defunct
 
 
 async def main():
-    private_key = os.getenv('PM_PRIVATE_KEY')
+    private_key = os.getenv('PM_PRIVATE_KEY')  # 使用 PM 钱包
     api_key = os.getenv('PREDICT_FUN_API_KEY')
-    predict_account = '0xe60eFb319e300c244Db089DEC83Bf3A12e9205e9'
 
     if not private_key or not api_key:
-        print("错误: 缺少环境变量")
+        print("错误: 缺少环境变量 PM_PRIVATE_KEY 或 PREDICT_FUN_API_KEY")
         return
 
     account = Account.from_key(private_key)
-    print(f'Signer (Login Wallet): {account.address}')
-    print(f'Predict account (资金账户): {predict_account}')
+    print(f'钱包: {account.address}')
     print(f'API Key: {api_key[:8]}...{api_key[-4:]}')
-
-    addresses = ADDRESSES_BY_CHAIN_ID[ChainId.BNB_MAINNET]
-    logger = get_logger('INFO')
-
-    builder = OrderBuilder(
-        chain_id=ChainId.BNB_MAINNET,
-        precision=4,
-        addresses=addresses,
-        generate_salt_fn=generate_order_salt,
-        logger=logger,
-        signer=account,
-        predict_account=predict_account,
-    )
 
     base_url = "https://api.predict.fun/v1"
     headers = {"X-API-Key": api_key}
@@ -56,38 +40,35 @@ async def main():
         message = data["data"]["message"]
         print(f'消息: {message[:60]}...')
 
-        # 2. 使用 signer wallet 标准签名 (NOT predict account signing)
+        # 2. 签名
         print("\n" + "=" * 60)
-        print("步骤 2: 使用 Signer Wallet 标准 EIP-191 签名")
+        print("步骤 2: 签名消息")
         print("=" * 60)
-        from eth_account.messages import encode_defunct
         msg = encode_defunct(text=message)
         signed = account.sign_message(msg)
         signature = '0x' + signed.signature.hex()
-        print(f'签名: {signature[:40]}...')
+        print(f'签名: {signature[:50]}...')
 
-        # 3. 获取 JWT - 使用 signer wallet address
+        # 3. 获取 JWT - 字段名是 'signer' 不是 'walletAddress'
         print("\n" + "=" * 60)
-        print("步骤 3: 获取 JWT (使用 Signer Wallet Address)")
+        print("步骤 3: 获取 JWT")
         print("=" * 60)
         auth_payload = {
             "message": message,
             "signature": signature,
-            "walletAddress": account.address,  # 使用 signer wallet, 不是 predict account
+            "signer": account.address,  # 关键: 字段名是 'signer'
         }
-        print(f'请求体: walletAddress={account.address}')
+        print(f'请求: signer={account.address}')
 
         auth_resp = await client.post("/auth", json=auth_payload)
-        print(f'响应状态: {auth_resp.status_code}')
         auth_data = auth_resp.json()
-        print(f'响应: {auth_data}')
 
         if not auth_data.get("success"):
-            print("\n认证失败!")
+            print(f"认证失败: {auth_data}")
             return
 
         jwt = auth_data["data"]["token"]
-        print(f'JWT: {jwt[:40]}...')
+        print(f'JWT: {jwt[:50]}...')
 
         # 添加 Authorization header
         client.headers["Authorization"] = f"Bearer {jwt}"
@@ -96,33 +77,22 @@ async def main():
         print("\n" + "=" * 60)
         print("步骤 4: 获取市场信息")
         print("=" * 60)
-        resp = await client.get("/markets", params={"limit": 5})
+        resp = await client.get("/markets", params={"limit": 20})
         markets_data = resp.json()
         markets = markets_data.get("data", [])
         active = [m for m in markets if m.get("status") == "REGISTERED"]
 
-        if not active:
-            print("未找到活跃市场")
-            return
-
-        market = active[0]
-        market_id = market.get("id")
-        title = market.get("title", "N/A")[:50]
-        outcomes = market.get("outcomes", [])
-
-        print(f'市场: {title}...')
-        print(f'Market ID: {market_id}')
-        print(f'Outcomes: {len(outcomes)}')
-
-        for i, o in enumerate(outcomes):
-            print(f'  [{i}] {o.get("name")}: {o.get("onChainId", "N/A")[:30]}...')
+        print(f'活跃市场数: {len(active)}')
+        for m in active[:5]:
+            title = m.get("title", "N/A")[:40]
+            market_id = m.get("id")
+            print(f'  [{market_id}] {title}...')
 
         # 5. 检查开放订单
         print("\n" + "=" * 60)
         print("步骤 5: 检查开放订单")
         print("=" * 60)
         orders_resp = await client.get("/orders")
-        print(f'订单响应: {orders_resp.status_code}')
         if orders_resp.status_code == 200:
             orders = orders_resp.json().get("data", [])
             print(f'开放订单数: {len(orders)}')
@@ -130,7 +100,7 @@ async def main():
             print(f'错误: {orders_resp.text[:200]}')
 
         print("\n" + "=" * 60)
-        print("测试完成!")
+        print("✅ 测试完成!")
         print("=" * 60)
 
 
