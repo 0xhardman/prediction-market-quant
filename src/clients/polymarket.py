@@ -121,17 +121,25 @@ class PolymarketClient(BaseClient):
 
         return Orderbook(bids=bids, asks=asks, timestamp=time())
 
-    async def place_order(self, side: Side, price: float, size: float) -> Order:
+    async def place_order(
+        self,
+        side: Side,
+        price: float,
+        size: float,
+        order_type: str = "GTC",
+    ) -> Order:
         """Place an order in the bound market.
 
         Args:
             side: BUY or SELL
             price: Price per share (0-1)
             size: Order size in shares (minimum 5 for Polymarket)
+            order_type: Order type - GTC (default), FOK, FAK, GTD
         """
         self._ensure_connected()
 
-        logger.info(f"Placing order: {side.value} {size} @ {price}")
+        ot = getattr(OrderType, order_type, OrderType.GTC)
+        logger.info(f"Placing order: {side.value} {size} @ {price} ({order_type})")
 
         order_side = BUY if side == Side.BUY else SELL
         order_args = OrderArgs(
@@ -143,7 +151,7 @@ class PolymarketClient(BaseClient):
 
         try:
             signed_order = self._client.create_order(order_args)
-            resp = self._client.post_order(signed_order, OrderType.GTC)
+            resp = self._client.post_order(signed_order, ot)
         except Exception as e:
             error_msg = str(e).lower()
             logger.error(f"Order placement failed: {e}")

@@ -9,6 +9,9 @@ from predict_sdk import (
     OrderBuilderOptions,
     BuildOrderInput,
     LimitHelperInput,
+    MarketHelperInput,
+    MarketHelperValueInput,
+    Book,
     Side as SdkSide,
 )
 
@@ -344,3 +347,141 @@ class PredictFunClient(BaseClient):
 
         logger.debug(f"Retrieved {len(orders)} orders")
         return orders
+
+    def _build_sdk_book(self, ob: Orderbook) -> Book:
+        """Convert internal Orderbook to SDK Book format."""
+        return Book(
+            market_id=self.market_id,
+            update_timestamp_ms=int(ob.timestamp * 1000),
+            bids=ob.bids,  # Already [(price, size), ...]
+            asks=ob.asks,
+        )
+
+    async def place_market_order(
+        self,
+        side: Side,
+        size: float | None = None,
+        value: float | None = None,
+    ) -> Order:
+        """Place a market order.
+
+        For BUY orders, specify value (USD amount to spend).
+        For SELL orders, specify size (number of shares to sell).
+
+        Args:
+            side: BUY or SELL
+            size: Number of shares (required for SELL, optional for BUY)
+            value: USD value to spend (required for BUY if size not provided)
+
+        Returns:
+            Order object with execution details
+        """
+        self._ensure_connected()
+        await self._ensure_valid_token()
+
+        # Validate parameters
+        if side == Side.BUY and size is None and value is None:
+            raise ValueError("BUY market order requires either size or value")
+        if side == Side.SELL and size is None:
+            raise ValueError("SELL market order requires size")
+
+        # Get orderbook for price calculation
+        ob = await self.get_orderbook()
+        sdk_book = self._build_sdk_book(ob)
+
+        sdk_side = SdkSide.BUY if side == Side.BUY else SdkSide.SELL
+
+        # Calculate amounts based on input type
+        if side == Side.BUY and value is not None:
+            # BUY by value
+            value_wei = int(value * 1e18)
+            logger.info(f"Placing market order: {side.value} ${value:.2f}")
+            amounts = self._builder.get_market_order_amounts(
+                MarketHelperValueInput(side=SdkSide.BUY, value_wei=value_wei),
+                sdk_book,
+            )
+        else:
+            # BUY/SELL by quantity
+            size_wei = int(size * 1e18)
+            logger.info(f"Placing market order: {side.value} {size} shares")
+            amounts = self._builder.get_market_order_amounts(
+                MarketHelperInput(side=sdk_side, quantity_wei=size_wei),
+                sdk_book,
+            )
+
+        # Build order with MARKET strategy
+        order = self._builder.build_order(
+            "MARKET",
+            BuildOrderInput(
+                token_id=self.token_id,
+                side=sdk_side,
+                maker_amount=amounts.maker_amount,
+                taker_amount=amounts.taker_amount,
+                fee_rate_bps=200,  # 2% fee
+            ),
+        )
+
+        # Sign order
+        typed_data = self._builder.build_typed_data(
+            order, is_neg_risk=False, is_yield_bearing=False
+        )
+        order_hash = self._builder.build_typed_data_hash(typed_data)
+        signed = self._builder.sign_typed_data_order(typed_data)
+
+        # Build payload
+        signature = signed.signature
+        if not signature.startswith("0x"):
+            signature = "0x" + signature
+
+        order_payload = {
+            "hash": order_hash,
+            "salt": str(order.salt),
+            "maker": order.maker,
+            "signer": order.signer,
+            "taker": order.taker,
+            "tokenId": str(order.token_id),
+            "makerAmount": str(order.maker_amount),
+            "takerAmount": str(order.taker_amount),
+            "expiration": str(order.expiration),
+            "nonce": str(order.nonce),
+            "feeRateBps": str(order.fee_rate_bps),
+            "side": order.side,
+            "signatureType": order.signature_type,
+            "signature": signature,
+        }
+
+        # Submit order
+        resp = await self._http.post(
+            "/orders",
+            json={
+                "data": {
+                    "pricePerShare": str(amounts.price_per_share),
+                    "strategy": "MARKET",
+                    "slippageBps": "100",  # 1% slippage for market orders
+                    "order": order_payload,
+                }
+            },
+        )
+
+        result = resp.json()
+        if resp.status_code in (200, 201) and result.get("success"):
+            returned_hash = result.get("data", {}).get("orderHash", order_hash)
+            avg_price = amounts.price_per_share / 1e18
+            logger.info(f"Market order placed: hash={returned_hash[:30]}... avg_price={avg_price:.4f}")
+            return Order(
+                id=returned_hash,
+                token_id=self.token_id,
+                side=side,
+                price=avg_price,
+                size=size or (value / avg_price if avg_price > 0 else 0),
+                status=OrderStatus.FILLED,  # Market orders fill immediately
+            )
+        else:
+            error_msg = result.get("message", "") or result.get("error", {}).get(
+                "description", ""
+            )
+            logger.error(f"Market order failed: {error_msg}")
+            error_lower = error_msg.lower()
+            if "insufficient" in error_lower or "collateral" in error_lower:
+                raise InsufficientBalanceError()
+            raise OrderRejectedError(error_msg)
