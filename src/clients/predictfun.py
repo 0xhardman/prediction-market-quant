@@ -5,8 +5,10 @@ from typing import Dict, Optional
 
 import httpx
 from aiolimiter import AsyncLimiter
-from eth_account import Account
-from eth_account.messages import encode_defunct
+from predict_sdk import (
+    OrderBuilder, ChainId, OrderBuilderOptions,
+    BuildOrderInput, LimitHelperInput, Side as SDKSide
+)
 
 from ..config import Config
 from ..models import Orderbook, OrderResult, OrderStatus, Platform, Side
@@ -18,6 +20,10 @@ class PredictFunClient(BaseClient):
     """Predict.fun client with REST API for orderbook and trading."""
 
     BASE_URL = "https://api.predict.fun/v1"
+
+    # Contract addresses (BNB Mainnet)
+    CTF_EXCHANGE = "0x8BC070BEdAB741406F4B1Eb65A72bee27894B689"
+    NEG_RISK_CTF_EXCHANGE = "0x365fb81bd4A24D6303cd2F19c349dE6894D8d58A"
 
     def __init__(self, config: Config):
         self.config = config
@@ -35,7 +41,11 @@ class PredictFunClient(BaseClient):
         # Credentials
         self._api_key = config.credentials.predict_fun.api_key
         self._private_key = config.credentials.predict_fun.private_key
+        self._smart_wallet = config.credentials.predict_fun.smart_wallet
         self._jwt_token: Optional[str] = None
+
+        # SDK builder (cached after authentication)
+        self._builder: Optional[OrderBuilder] = None
 
     async def connect(self) -> None:
         """Initialize HTTP client and authenticate."""
@@ -56,8 +66,9 @@ class PredictFunClient(BaseClient):
         self.logger.info("Predict.fun client connected")
 
     async def _authenticate(self) -> bool:
-        """Authenticate and get JWT token."""
-        if not self._private_key or not self._http_client:
+        """Authenticate and get JWT token using Predict Account mode."""
+        if not self._private_key or not self._smart_wallet or not self._http_client:
+            self.logger.error("Missing private_key or smart_wallet for authentication")
             return False
 
         try:
@@ -74,19 +85,21 @@ class PredictFunClient(BaseClient):
 
             message = data["data"]["message"]
 
-            # 2. Sign message
-            account = Account.from_key(self._private_key)
-            msg = encode_defunct(text=message)
-            signed = account.sign_message(msg)
-            signature = "0x" + signed.signature.hex()
+            # 2. Sign message using SDK (Predict Account mode)
+            builder = OrderBuilder.make(
+                ChainId.BNB_MAINNET,
+                self._private_key,
+                OrderBuilderOptions(predict_account=self._smart_wallet),
+            )
+            signature = builder.sign_predict_account_message(message)
 
-            # 3. Get JWT - field name is 'signer', not 'walletAddress'
+            # 3. Get JWT - signer is Smart Wallet address in Predict Account mode
             auth_resp = await self._http_client.post(
                 "/auth",
                 json={
                     "message": message,
                     "signature": signature,
-                    "signer": account.address,
+                    "signer": self._smart_wallet,
                 },
             )
 
@@ -101,7 +114,8 @@ class PredictFunClient(BaseClient):
 
             self._jwt_token = auth_data["data"]["token"]
             self._http_client.headers["Authorization"] = f"Bearer {self._jwt_token}"
-            self.logger.info(f"Authenticated as {account.address}")
+            self._builder = builder  # Cache the builder for order signing
+            self.logger.info(f"Authenticated as Smart Wallet {self._smart_wallet}")
             return True
 
         except Exception as e:
@@ -232,6 +246,67 @@ class PredictFunClient(BaseClient):
             return self._orderbooks[token_id]
         return await self.fetch_orderbook(token_id)
 
+    def _create_signed_order(
+        self,
+        token_id: str,
+        side: Side,
+        price: float,
+        size: float,
+    ) -> tuple:
+        """Create and sign order using predict_sdk.
+
+        Returns: (order_payload, order_hash, price_wei)
+        """
+        if not self._builder:
+            self._builder = OrderBuilder.make(
+                ChainId.BNB_MAINNET,
+                self._private_key,
+                OrderBuilderOptions(predict_account=self._smart_wallet),
+            )
+
+        price_wei = int(price * 1e18)
+        size_wei = int(size * 1e18)
+        sdk_side = SDKSide.BUY if side == Side.BUY else SDKSide.SELL
+
+        amounts = self._builder.get_limit_order_amounts(LimitHelperInput(
+            side=sdk_side,
+            price_per_share_wei=price_wei,
+            quantity_wei=size_wei,
+        ))
+
+        order = self._builder.build_order('LIMIT', BuildOrderInput(
+            token_id=token_id,
+            side=sdk_side,
+            maker_amount=amounts.maker_amount,
+            taker_amount=amounts.taker_amount,
+            fee_rate_bps=200,
+        ))
+
+        typed_data = self._builder.build_typed_data(
+            order, is_neg_risk=False, is_yield_bearing=False
+        )
+        order_hash = self._builder.build_typed_data_hash(typed_data)
+        signed = self._builder.sign_typed_data_order(typed_data)
+
+        order_payload = {
+            'hash': order_hash,
+            'salt': str(order.salt),
+            'maker': order.maker,
+            'signer': order.signer,
+            'taker': order.taker,
+            'tokenId': str(order.token_id),
+            'makerAmount': str(order.maker_amount),
+            'takerAmount': str(order.taker_amount),
+            'expiration': str(order.expiration),
+            'nonce': str(order.nonce),
+            'feeRateBps': str(order.fee_rate_bps),
+            'side': order.side,
+            'signatureType': order.signature_type,
+            'signature': '0x' + signed.signature if not signed.signature.startswith('0x') else signed.signature,
+        }
+
+        return order_payload, order_hash, price_wei
+
     async def place_order(
         self,
         token_id: str,
@@ -239,18 +314,57 @@ class PredictFunClient(BaseClient):
         price: float,
         size: float,
     ) -> OrderResult:
-        """Place a limit order."""
-        order_data = {
-            "tokenId": token_id,
-            "side": side.value.upper(),
-            "price": str(price),
-            "size": str(size),
-            "type": "LIMIT",
-        }
+        """Place a signed limit order."""
+        try:
+            # Create signed order using SDK
+            order_payload, order_hash, price_wei = self._create_signed_order(
+                token_id, side, price, size
+            )
 
-        result = await self._request("POST", "/order", json=order_data)
+            # Submit order
+            order_data = {
+                "data": {
+                    "pricePerShare": str(price_wei),
+                    "strategy": "LIMIT",
+                    "slippageBps": "0",
+                    "order": order_payload,
+                }
+            }
 
-        if not result or not result.get("success"):
+            result = await self._request("POST", "/orders", json=order_data)
+
+            if not result or not result.get("success"):
+                self.logger.error(f"Order failed: {result}")
+                return OrderResult(
+                    order_id="",
+                    platform=Platform.PREDICT_FUN,
+                    token_id=token_id,
+                    side=side,
+                    price=price,
+                    requested_size=size,
+                    filled_size=0.0,
+                    status=OrderStatus.FAILED,
+                )
+
+            data = result.get("data", {})
+            # Prefer numeric id, fallback to orderHash
+            order_id = str(data.get("id", data.get("orderId", order_hash)))
+
+            self.logger.info(f"PF Order submitted: {order_id}")
+
+            return OrderResult(
+                order_id=order_id,
+                platform=Platform.PREDICT_FUN,
+                token_id=token_id,
+                side=side,
+                price=price,
+                requested_size=size,
+                filled_size=0.0,
+                status=OrderStatus.PENDING,
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to place order: {e}")
             return OrderResult(
                 order_id="",
                 platform=Platform.PREDICT_FUN,
@@ -262,24 +376,50 @@ class PredictFunClient(BaseClient):
                 status=OrderStatus.FAILED,
             )
 
-        data = result.get("data", {})
-        order_id = str(data.get("orderId", data.get("id", "")))
-
-        return OrderResult(
-            order_id=order_id,
-            platform=Platform.PREDICT_FUN,
-            token_id=token_id,
-            side=side,
-            price=price,
-            requested_size=size,
-            filled_size=0.0,
-            status=OrderStatus.PENDING,
-        )
-
     async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order."""
-        result = await self._request("DELETE", f"/order/{order_id}")
-        return result is not None and result.get("success", False)
+        """Cancel an order by ID.
+
+        Note: order_id should be the numeric ID from place_order response.
+        If it's a hash, we need to query orders first to find the ID.
+        """
+        # If order_id is a hash, query orders to find numeric ID
+        if order_id.startswith("0x"):
+            orders_result = await self._request("GET", "/orders")
+            if not orders_result:
+                self.logger.error("Failed to query orders")
+                return False
+
+            found_id = None
+            for o in orders_result.get("data", []):
+                if o.get("order", {}).get("hash") == order_id:
+                    found_id = str(o.get("id"))
+                    break
+
+            if not found_id:
+                self.logger.error(f"Order not found by hash: {order_id}")
+                return False
+
+            order_id = found_id
+
+        # Use correct API: POST /orders/remove
+        result = await self._request("POST", "/orders/remove", json={
+            "data": {"ids": [order_id]}
+        })
+
+        if not result:
+            return False
+
+        removed = result.get("removed", [])
+        noop = result.get("noop", [])
+
+        if removed:
+            self.logger.info(f"Order cancelled: {removed}")
+            return True
+        elif noop:
+            self.logger.info(f"Order already cancelled/filled: {noop}")
+            return True
+
+        return False
 
     async def get_order_status(self, order_id: str) -> Optional[OrderResult]:
         """Get order status."""

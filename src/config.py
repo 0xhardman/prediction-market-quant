@@ -102,6 +102,7 @@ class PredictFunCredentials:
     """Predict.fun API credentials."""
     api_key: str = ""
     private_key: str = ""
+    smart_wallet: str = ""  # Predict Smart Wallet address (maker)
 
 
 @dataclass
@@ -272,6 +273,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
         predict_fun=PredictFunCredentials(
             api_key=pf_creds.get("api_key", ""),
             private_key=pf_creds.get("private_key", ""),
+            smart_wallet=pf_creds.get("smart_wallet", ""),
         ),
     )
 

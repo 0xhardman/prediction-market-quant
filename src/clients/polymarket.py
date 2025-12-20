@@ -150,16 +150,21 @@ class PolymarketClient(BaseClient):
         try:
             data = json.loads(message)
 
-            # Handle different message types
-            msg_type = data.get("type", "")
+            # Handle list (batch of orderbook snapshots)
+            if isinstance(data, list):
+                for item in data:
+                    await self._update_orderbook(item)
+                return
 
-            if msg_type == "book":
-                # Orderbook update
+            # Handle dict messages
+            if "price_changes" in data:
+                # Price change notification - update from price_changes array
+                for change in data.get("price_changes", []):
+                    await self._update_price_change(data.get("market"), change)
+            elif "asset_id" in data:
+                # Single orderbook update
                 await self._update_orderbook(data)
-            elif msg_type == "price_change":
-                # Price change notification
-                await self._update_orderbook(data)
-            elif msg_type == "error":
+            elif data.get("type") == "error":
                 self.logger.error(f"WS error: {data.get('message', 'Unknown error')}")
 
         except json.JSONDecodeError:
@@ -168,8 +173,8 @@ class PolymarketClient(BaseClient):
             self.logger.error(f"Error handling message: {e}")
 
     async def _update_orderbook(self, data: dict) -> None:
-        """Update orderbook cache from WebSocket data."""
-        token_id = data.get("asset_id") or data.get("market")
+        """Update orderbook cache from WebSocket snapshot."""
+        token_id = data.get("asset_id")
         if not token_id:
             return
 
@@ -190,6 +195,38 @@ class PolymarketClient(BaseClient):
             ask_size=ask_size,
             timestamp=time.time(),
         )
+
+    async def _update_price_change(self, market: str, change: dict) -> None:
+        """Update orderbook from price change message."""
+        token_id = change.get("asset_id")
+        if not token_id:
+            return
+
+        best_bid = float(change.get("best_bid", 0))
+        best_ask = float(change.get("best_ask", 1))
+
+        # Update existing orderbook or create new one
+        if token_id in self._orderbooks:
+            ob = self._orderbooks[token_id]
+            self._orderbooks[token_id] = Orderbook(
+                platform=Platform.POLYMARKET,
+                token_id=token_id,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_size=ob.bid_size,  # Keep previous size
+                ask_size=ob.ask_size,
+                timestamp=time.time(),
+            )
+        else:
+            self._orderbooks[token_id] = Orderbook(
+                platform=Platform.POLYMARKET,
+                token_id=token_id,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_size=0.0,
+                ask_size=0.0,
+                timestamp=time.time(),
+            )
 
     async def subscribe_orderbook(self, token_id: str) -> None:
         """Subscribe to orderbook updates for a token."""
