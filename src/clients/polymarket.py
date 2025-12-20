@@ -4,7 +4,7 @@ from time import time
 
 import httpx
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .base import BaseClient
@@ -192,7 +192,8 @@ class PolymarketClient(BaseClient):
         self._ensure_connected()
 
         try:
-            result = self._client.get_balance_allowance()
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self._client.get_balance_allowance(params)
             # Result contains 'balance' field in wei (6 decimals for USDC)
             balance_str = result.get("balance", "0")
             balance = float(balance_str) / 1e6  # USDC has 6 decimals
