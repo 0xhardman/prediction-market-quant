@@ -308,11 +308,15 @@ class PolymarketClient(BaseClient):
             )
 
         try:
+            # Convert USD size to shares
+            # size is in USD, shares = usd / price
+            shares = size / price if price > 0 else size
+
             # Create order args
             clob_side = BUY if side == Side.BUY else SELL
             order_args = OrderArgs(
                 price=price,
-                size=size,
+                size=shares,
                 side=clob_side,
                 token_id=token_id,
             )
@@ -327,7 +331,7 @@ class PolymarketClient(BaseClient):
 
             if status_str == "matched":
                 status = OrderStatus.FILLED
-                filled_size = size
+                filled_size = size  # Return USD size
             elif status_str == "live":
                 status = OrderStatus.PENDING
                 filled_size = 0.0
@@ -336,7 +340,7 @@ class PolymarketClient(BaseClient):
                 filled_size = 0.0
 
             self.logger.info(
-                f"PM Order {order_id}: {side.value} {size} @ {price} -> {status.value}"
+                f"PM Order {order_id}: {side.value} ${size:.2f} ({shares:.1f} shares) @ {price} -> {status.value}"
             )
 
             return OrderResult(

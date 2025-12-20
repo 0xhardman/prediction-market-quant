@@ -264,14 +264,18 @@ class PredictFunClient(BaseClient):
                 OrderBuilderOptions(predict_account=self._smart_wallet),
             )
 
+        # Convert USD size to shares
+        # size is in USD, shares = usd / price
+        shares = size / price if price > 0 else size
+
         price_wei = int(price * 1e18)
-        size_wei = int(size * 1e18)
+        shares_wei = int(shares * 1e18)
         sdk_side = SDKSide.BUY if side == Side.BUY else SDKSide.SELL
 
         amounts = self._builder.get_limit_order_amounts(LimitHelperInput(
             side=sdk_side,
             price_per_share_wei=price_wei,
-            quantity_wei=size_wei,
+            quantity_wei=shares_wei,
         ))
 
         order = self._builder.build_order('LIMIT', BuildOrderInput(
