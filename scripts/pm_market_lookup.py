@@ -137,6 +137,7 @@ def print_market_info(market: dict, source: str = ""):
     print("\n其他信息:")
     print(f"  活跃: {market.get('active', 'N/A')}")
     print(f"  已关闭: {market.get('closed', 'N/A')}")
+    print(f"  手续费: 0% (Polymarket 无 Taker Fee)")
 
     # 结算条件
     description = market.get("description", "")

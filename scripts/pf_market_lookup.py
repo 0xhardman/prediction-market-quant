@@ -99,23 +99,40 @@ class PFLookup:
             self._client = None
 
     async def fetch_markets(self, limit: int = 200) -> list:
-        """获取所有活跃市场"""
+        """获取所有活跃市场（从 /markets 和 /categories 两个端点）"""
         client = await self._get_client()
         all_markets = []
-        offset = 0
+        seen_ids = set()
 
+        # 1. 从 /markets 端点获取
+        offset = 0
         while True:
             resp = await client.get(
                 "/markets",
-                params={"limit": limit, "offset": offset, "status": "REGISTERED"},
+                params={"limit": limit, "offset": offset},
             )
             data = resp.json().get("data", [])
             if not data:
                 break
-            all_markets.extend(data)
+            for m in data:
+                if m.get("id") not in seen_ids:
+                    all_markets.append(m)
+                    seen_ids.add(m.get("id"))
             if len(data) < limit:
                 break
             offset += limit
+
+        # 2. 从 /categories 端点获取（包含更多市场）
+        try:
+            resp = await client.get("/categories", params={"limit": 500})
+            categories = resp.json().get("data", [])
+            for cat in categories:
+                for m in cat.get("markets", []):
+                    if m.get("id") not in seen_ids:
+                        all_markets.append(m)
+                        seen_ids.add(m.get("id"))
+        except Exception:
+            pass
 
         return all_markets
 
@@ -176,6 +193,9 @@ class PFLookup:
         print(f"YES Token: {yes_token}")
         print(f"NO Token:  {no_token}")
         print()
+        fee_bps = market.get("feeRateBps", 200)
+        fee_pct = fee_bps / 100
+        print(f"手续费: {fee_pct:.1f}% (Taker Fee)")
         print(f"当前价格: YES Bid {bid:.4f} | Ask {ask:.4f}")
 
         # 结算条件
@@ -298,27 +318,62 @@ async def url_mode(lookup: PFLookup, url: str):
     print("正在获取市场列表...")
 
     markets = await lookup.fetch_markets()
-    categories = lookup.group_by_category(markets)
 
-    if slug not in categories:
-        print(f"未找到匹配的 Event: {slug}")
+    # 从 slug 提取关键词进行模糊匹配
+    # 例如 "will-gold-close-above-4400-in-2025" -> ["gold", "4400"]
+    stop_words = ["will", "the", "and", "for", "above", "below", "close", "reach", "2024", "2025", "2026"]
+    keywords = [w for w in slug.lower().split("-") if len(w) > 2 and w not in stop_words]
+
+    print(f"搜索关键词: {keywords}")
+
+    # 先尝试精确匹配 categorySlug
+    matching_markets = [
+        m for m in markets
+        if m.get("categorySlug") == slug
+    ]
+
+    if not matching_markets:
+        # 尝试模糊匹配：任意关键词出现在 title 或 question 中
+        matching_markets = [
+            m for m in markets
+            if any(kw in m.get("title", "").lower() or kw in m.get("question", "").lower() for kw in keywords)
+        ]
+
+    if not matching_markets:
+        print(f"未找到匹配的市场: {slug}")
         print()
-        print("可用的 Events:")
-        for s in sorted(categories.keys()):
-            print(f"  - {s}")
+        print(f"共获取到 {len(markets)} 个活跃市场，但没有包含关键词 {keywords} 的市场")
+        print()
+        print("这个市场可能:")
+        print("  1. 已经结算/关闭")
+        print("  2. 尚未创建")
+        print("  3. 关键词不匹配")
+        print()
+        print("部分可用市场:")
+        for m in markets[:10]:
+            print(f"  [{m.get('id')}] {m.get('question', '')[:60]}...")
         return
 
-    ms = categories[slug]
     print()
-    print(f"📊 Event: {slug} ({len(ms)} markets)")
+    print(f"找到 {len(matching_markets)} 个匹配的市场:")
     print()
-    print("Markets:")
 
-    for m in ms:
+    for m in matching_markets:
         mid = m.get("id")
-        title = m.get("title", "N/A")
-        question = m.get("question", "")[:40]
-        print(f"  [{mid}] {title} - {question}...")
+        question = m.get("question", "")[:60]
+        status = m.get("status", "")
+        print(f"  [{mid}] {question}... ({status})")
+
+    if len(matching_markets) == 1:
+        # 只有一个市场，直接显示详情
+        market = matching_markets[0]
+        market_id = market.get("id")
+        print()
+        print("正在获取市场详情...")
+        market = await lookup.fetch_market(market_id)
+        bid, ask = await lookup.get_market_price(market_id)
+        lookup.print_market_details(market, bid, ask)
+        return
 
     print()
     try:
