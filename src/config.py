@@ -302,13 +302,11 @@ def validate_config(config: Config) -> list[str]:
     if not enabled_markets:
         errors.append("No enabled markets configured")
 
-    # Check credentials
+    # Check PM + PF credentials
     if not config.credentials.polymarket.private_key:
         errors.append("Polymarket private key not configured")
-    if not config.credentials.polymarket.api_key:
-        errors.append("Polymarket API key not configured")
-    if not config.credentials.opinion.api_key:
-        errors.append("Opinion API key not configured")
+    if not config.credentials.predict_fun.api_key:
+        errors.append("Predict.fun API key not configured")
 
     # Check arbitrage parameters
     if config.arbitrage.min_profit_threshold <= 0:

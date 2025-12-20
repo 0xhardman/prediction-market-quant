@@ -122,7 +122,7 @@ class ExecutionResult:
     success: bool
     reason: str = ""
     pm_order: Optional[OrderResult] = None
-    op_order: Optional[OrderResult] = None
+    pf_order: Optional[OrderResult] = None  # Predict.fun order
     unhedged: float = 0.0    # Amount of unhedged exposure
     timestamp: float = field(default_factory=time.time)
 

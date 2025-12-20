@@ -5,46 +5,42 @@
 # 支持任意两个或三个平台的配对
 markets:
   # 示例配置，需要替换为实际的token ID
-  - name: "示例市场"
-    enabled: false  # 设为true启用
+  - name: "Will Bitcoin reach $100,000 by December 31, 2025?"
+    enabled: true # 设为true启用
     polymarket:
-      condition_id: "0x..."
-      yes_token_id: "0x..."
-      no_token_id: "0x..."
-    opinion:
-      market_id: 0
-      yes_token_id: "0x..."
-      no_token_id: "0x..."
+      condition_id: "0xd3cfc885ca1a482af4057f39937398fa5adc7a0b61e2381956384af1bf59ce6f"
+      yes_token_id: "92530351746682701626081429271272191534203523777966250895862560038889741880940"
+      no_token_id: "15002165665234016876486282630507392757515779060349352387653810600083538604826"
     predict_fun:
-      market_id: 0
-      yes_token_id: "0x..."
-      no_token_id: "0x..."
+      market_id: 415
+      yes_token_id: "14862668150972542930258837689755111839426102234146323070055218172124000064169"
+      no_token_id: "73674200514811390437572524782693189827263891365846575729678935460390541992074"
 
 # 套利参数
 arbitrage:
-  min_profit_threshold: 0.02     # 最小利润阈值 2%
-  max_position_size: 50          # 单次最大金额 $50
-  min_position_size: 10          # 单次最小金额 $10
-  max_unhedged_exposure: 50      # 单边敞口上限 $50
-  price_freshness_ms: 500        # 价格有效期 500ms
-  order_timeout_ms: 1000         # 订单超时 1000ms
+  min_profit_threshold: 0.02 # 最小利润阈值 2%
+  max_position_size: 10 # 单次最大金额 $50
+  min_position_size: 5 # 单次最小金额 $10
+  max_unhedged_exposure: 50 # 单边敞口上限 $50
+  price_freshness_ms: 500 # 价格有效期 500ms
+  order_timeout_ms: 1000 # 订单超时 1000ms
   aggressive_price_markup: 0.002 # Opinion下单溢价 0.2%
 
 # 费率配置
 fees:
   polymarket:
-    taker_fee: 0.0               # Polymarket全球平台无taker fee
-    gas_estimate: 0.05           # Polygon gas ~$0.05
+    taker_fee: 0.0 # Polymarket全球平台无taker fee
+    gas_estimate: 0.05 # Polygon gas ~$0.05
   opinion:
-    taker_fee: 0.01              # Opinion交易费 1% (保守估计)
-    gas_estimate: 0.10           # BNB Chain gas ~$0.10
+    taker_fee: 0.01 # Opinion交易费 1% (保守估计)
+    gas_estimate: 0.10 # BNB Chain gas ~$0.10
   predict_fun:
-    taker_fee: 0.02              # Predict.fun交易费 2% (feeRateBps: 200)
-    gas_estimate: 0.10           # BNB Chain gas ~$0.10
+    taker_fee: 0.02 # Predict.fun交易费 2% (feeRateBps: 200)
+    gas_estimate: 0.10 # BNB Chain gas ~$0.10
 
 # 监控配置
 monitoring:
-  opinion_poll_interval: 0.5     # Opinion轮询间隔 (秒)
+  opinion_poll_interval: 0.5 # Opinion轮询间隔 (秒)
   log_level: INFO
   log_to_file: true
   log_file: "arbitrage.log"
@@ -62,7 +58,7 @@ credentials:
     private_key: "${OPINION_PRIVATE_KEY}"
   predict_fun:
     api_key: "${PREDICT_FUN_API_KEY}"
-    private_key: "${PM_PRIVATE_KEY}"  # 使用 PM 钱包签名认证
+    private_key: "${PM_PRIVATE_KEY}" # 使用 PM 钱包签名认证
 
 # 代理配置 (Opinion地区限制)
 proxy:

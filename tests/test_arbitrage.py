@@ -120,11 +120,13 @@ class TestArbitrageEngine:
         engine = ArbitrageEngine(config)
         market = MockMarket()
 
-        # Small profit scenario (~3%)
-        pm_yes = create_orderbook(Platform.POLYMARKET, "pm_yes", 0.44, 0.45)
-        pm_no = create_orderbook(Platform.POLYMARKET, "pm_no", 0.54, 0.55)
-        op_yes = create_orderbook(Platform.OPINION, "op_yes", 0.54, 0.55)
-        op_no = create_orderbook(Platform.OPINION, "op_no", 0.34, 0.35)
+        # Small profit scenario (~8% < 10% threshold)
+        # PM Yes @ 0.50 + OP No @ 0.42 = 0.92 + 0.42*0.01 fee = 0.9242
+        # Profit = (1 - 0.9242) / 0.9242 = 8.2%
+        pm_yes = create_orderbook(Platform.POLYMARKET, "pm_yes", 0.49, 0.50)
+        pm_no = create_orderbook(Platform.POLYMARKET, "pm_no", 0.49, 0.50)
+        op_yes = create_orderbook(Platform.OPINION, "op_yes", 0.49, 0.50)
+        op_no = create_orderbook(Platform.OPINION, "op_no", 0.41, 0.42)
 
         result = engine.check_arbitrage(market, pm_yes, pm_no, op_yes, op_no)
         assert result is None  # Below 10% threshold
@@ -258,11 +260,13 @@ class TestArbitrageEnginePMPF:
         engine = ArbitrageEngine(config)
         market = MockMarket()
 
-        # Marginal profit scenario
-        pm_yes = create_orderbook(Platform.POLYMARKET, "pm_yes", 0.44, 0.45)
-        pm_no = create_orderbook(Platform.POLYMARKET, "pm_no", 0.54, 0.55)
-        pf_yes = create_orderbook(Platform.PREDICT_FUN, "pf_yes", 0.54, 0.55)
-        pf_no = create_orderbook(Platform.PREDICT_FUN, "pf_no", 0.34, 0.35)
+        # Small profit scenario (~7.7% < 10% threshold)
+        # PM Yes @ 0.50 + PF No @ 0.42 = 0.92 + 0.42*0.02 fee = 0.9284
+        # Profit = (1 - 0.9284) / 0.9284 = 7.7%
+        pm_yes = create_orderbook(Platform.POLYMARKET, "pm_yes", 0.49, 0.50)
+        pm_no = create_orderbook(Platform.POLYMARKET, "pm_no", 0.49, 0.50)
+        pf_yes = create_orderbook(Platform.PREDICT_FUN, "pf_yes", 0.49, 0.50)
+        pf_no = create_orderbook(Platform.PREDICT_FUN, "pf_no", 0.41, 0.42)
 
         result = engine.check_arbitrage_pm_pf(market, pm_yes, pm_no, pf_yes, pf_no)
         assert result is None  # Below 10% threshold
@@ -295,7 +299,7 @@ class TestArbitrageEnginePMPF:
         assert result is None
 
     def test_pf_higher_fees_reduce_profit(self):
-        """Verify PF's 2% fee is correctly applied."""
+        """Verify PF's 2% fee is correctly applied (no gas fees)."""
         config = MockConfig()
         engine = ArbitrageEngine(config)
         market = MockMarket()
@@ -304,9 +308,8 @@ class TestArbitrageEnginePMPF:
         # Total token cost: 0.80
         # PM fee: 0.40 * 0.00 = 0.00
         # PF fee: 0.40 * 0.02 = 0.008
-        # Gas: 0.05 + 0.10 = 0.15
-        # Total cost: 0.80 + 0.008 + 0.15 = 0.958
-        # Profit: (1.0 - 0.958) / 0.958 = 4.38%
+        # Total cost: 0.80 + 0.008 = 0.808
+        # Profit: (1.0 - 0.808) / 0.808 = 23.76%
         pm_yes = create_orderbook(Platform.POLYMARKET, "pm_yes", 0.39, 0.40)
         pm_no = create_orderbook(Platform.POLYMARKET, "pm_no", 0.58, 0.60)
         pf_yes = create_orderbook(Platform.PREDICT_FUN, "pf_yes", 0.58, 0.60)
@@ -315,10 +318,10 @@ class TestArbitrageEnginePMPF:
         result = engine.check_arbitrage_pm_pf(market, pm_yes, pm_no, pf_yes, pf_no)
 
         assert result is not None
-        # Expected total_cost = 0.40 + 0.40 + (0.40 * 0.02) + 0.15 = 0.958
-        assert result.total_cost == pytest.approx(0.958, rel=0.01)
-        # Profit = (1.0 - 0.958) / 0.958 ≈ 0.0438
-        assert result.profit_pct == pytest.approx(0.0438, rel=0.1)
+        # Expected total_cost = 0.40 + 0.40 + (0.40 * 0.02) = 0.808
+        assert result.total_cost == pytest.approx(0.808, rel=0.01)
+        # Profit = (1.0 - 0.808) / 0.808 ≈ 0.2376
+        assert result.profit_pct == pytest.approx(0.2376, rel=0.1)
 
 
 if __name__ == "__main__":

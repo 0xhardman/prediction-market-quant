@@ -19,9 +19,12 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 def extract_slug_from_url(url: str) -> str | None:
     """从 Polymarket URL 提取 market slug"""
     # https://polymarket.com/event/xxx/market-slug-123?tid=xxx
+    # 处理 shell 转义字符 (如 \? 变成 ?)
+    url = url.replace("\\?", "?").replace("\\=", "=")
     match = re.search(r'polymarket\.com/event/[^/]+/([^?]+)', url)
     if match:
-        return match.group(1)
+        slug = match.group(1).rstrip("\\")  # 移除可能残留的反斜杠
+        return slug
     return None
 
 
@@ -134,6 +137,14 @@ def print_market_info(market: dict, source: str = ""):
     print("\n其他信息:")
     print(f"  活跃: {market.get('active', 'N/A')}")
     print(f"  已关闭: {market.get('closed', 'N/A')}")
+
+    # 结算条件
+    description = market.get("description", "")
+    if description:
+        print("\n" + "-" * 60)
+        print("结算条件:")
+        print("-" * 60)
+        print(description)
 
     # 配置片段
     print("\n" + "-" * 60)

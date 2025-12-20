@@ -4,7 +4,7 @@ import asyncio
 from typing import List, Optional
 
 from ..clients.polymarket import PolymarketClient
-from ..clients.opinion import OpinionClient
+from ..clients.predictfun import PredictFunClient
 from ..config import Config
 from ..models import (
     ArbitrageOpportunity,
@@ -25,11 +25,11 @@ class OrderExecutor:
         self,
         config: Config,
         pm_client: PolymarketClient,
-        op_client: OpinionClient,
+        pf_client: PredictFunClient,
     ):
         self.config = config
         self.pm_client = pm_client
-        self.op_client = op_client
+        self.pf_client = pf_client
         self.logger = get_logger()
 
         # Track unhedged positions
@@ -48,9 +48,9 @@ class OrderExecutor:
         """
         Execute arbitrage with mixed strategy:
         - Polymarket: FOK order (Fill-Or-Kill)
-        - Opinion: Aggressive limit order + timeout cancel
+        - Predict.fun: Aggressive limit order + timeout cancel
 
-        Execution order: PM first (FOK ensures fill), then Opinion
+        Execution order: PM first (FOK ensures fill), then PF
         """
         self.logger.info(
             f"Executing arbitrage: {opportunity.direction.value} | "
@@ -75,28 +75,28 @@ class OrderExecutor:
 
         self.logger.info(f"PM order filled: {pm_result.filled_size}")
 
-        # Step 2: Place Opinion aggressive limit order
-        aggressive_price = opportunity.op_price * (1 + self.aggressive_markup)
-        op_order = await self.op_client.place_limit_order(
-            token_id=opportunity.op_token,
+        # Step 2: Place Predict.fun aggressive limit order
+        aggressive_price = opportunity.pf_price * (1 + self.aggressive_markup)
+        pf_order = await self.pf_client.place_order(
+            token_id=opportunity.pf_token,
             side=Side.BUY,
             price=aggressive_price,
             size=size,
         )
 
-        if op_order.status == OrderStatus.FAILED:
-            self.logger.error("Opinion order failed immediately")
+        if pf_order.status == OrderStatus.FAILED:
+            self.logger.error("Predict.fun order failed immediately")
             await self._handle_unhedged(
                 filled_order=pm_result,
-                missing_platform=Platform.OPINION,
+                missing_platform=Platform.PREDICT_FUN,
                 expected_size=size,
-                reason="OP_ORDER_FAILED",
+                reason="PF_ORDER_FAILED",
             )
             return ExecutionResult(
                 success=False,
-                reason="OP_ORDER_FAILED",
+                reason="PF_ORDER_FAILED",
                 pm_order=pm_result,
-                op_order=op_order,
+                pf_order=pf_order,
                 unhedged=size,
             )
 
@@ -104,37 +104,37 @@ class OrderExecutor:
         timeout_sec = self.order_timeout_ms / 1000
         await asyncio.sleep(timeout_sec)
 
-        op_status = await self.op_client.get_order_status(op_order.order_id)
+        pf_status = await self.pf_client.get_order_status(pf_order.order_id)
 
-        if op_status is None:
-            self.logger.error("Failed to get Opinion order status")
-            op_status = op_order
+        if pf_status is None:
+            self.logger.error("Failed to get Predict.fun order status")
+            pf_status = pf_order
 
         # Step 4: Evaluate result
-        if op_status.filled_size >= size * 0.95:  # 95%+ = success
+        if pf_status.filled_size >= size * 0.95:  # 95%+ = success
             self.logger.info(
                 f"Arbitrage successful! PM: {pm_result.filled_size}, "
-                f"OP: {op_status.filled_size}"
+                f"PF: {pf_status.filled_size}"
             )
             return ExecutionResult(
                 success=True,
                 pm_order=pm_result,
-                op_order=op_status,
+                pf_order=pf_status,
             )
 
         # Step 5: Cancel unfilled portion
-        if op_status.status == OrderStatus.PENDING:
-            await self.op_client.cancel_order(op_order.order_id)
-            self.logger.info(f"Cancelled Opinion order: {op_order.order_id}")
+        if pf_status.status == OrderStatus.PENDING:
+            await self.pf_client.cancel_order(pf_order.order_id)
+            self.logger.info(f"Cancelled Predict.fun order: {pf_order.order_id}")
 
         # Step 6: Handle unhedged exposure
-        if op_status.filled_size > 0:
+        if pf_status.filled_size > 0:
             # Partial fill
-            unhedged = size - op_status.filled_size
+            unhedged = size - pf_status.filled_size
             self.logger.warning(f"Partial fill, unhedged: ${unhedged:.2f}")
             await self._handle_unhedged(
                 filled_order=pm_result,
-                missing_platform=Platform.OPINION,
+                missing_platform=Platform.PREDICT_FUN,
                 expected_size=unhedged,
                 reason="PARTIAL_FILL",
             )
@@ -142,23 +142,23 @@ class OrderExecutor:
                 success=False,
                 reason="PARTIAL_FILL",
                 pm_order=pm_result,
-                op_order=op_status,
+                pf_order=pf_status,
                 unhedged=unhedged,
             )
         else:
-            # No fill on Opinion side
-            self.logger.warning(f"Opinion not filled, unhedged: ${size:.2f}")
+            # No fill on Predict.fun side
+            self.logger.warning(f"Predict.fun not filled, unhedged: ${size:.2f}")
             await self._handle_unhedged(
                 filled_order=pm_result,
-                missing_platform=Platform.OPINION,
+                missing_platform=Platform.PREDICT_FUN,
                 expected_size=size,
-                reason="OP_NOT_FILLED",
+                reason="PF_NOT_FILLED",
             )
             return ExecutionResult(
                 success=False,
-                reason="OP_NOT_FILLED",
+                reason="PF_NOT_FILLED",
                 pm_order=pm_result,
-                op_order=op_status,
+                pf_order=pf_status,
                 unhedged=size,
             )
 
@@ -209,12 +209,12 @@ class OrderExecutor:
             )
 
             # Get current orderbook
-            if position.missing_platform == Platform.OPINION:
-                ob = await self.op_client.get_orderbook(
+            if position.missing_platform == Platform.PREDICT_FUN:
+                ob = await self.pf_client.get_orderbook(
                     position.filled_order.token_id
                 )
                 if ob and ob.best_ask > 0:
-                    result = await self.op_client.place_order(
+                    result = await self.pf_client.place_order(
                         token_id=ob.token_id,
                         side=Side.BUY,
                         price=ob.best_ask * 1.01,  # 1% above ask

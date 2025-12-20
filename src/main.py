@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .clients.polymarket import PolymarketClient
-from .clients.opinion import OpinionClient
+from .clients.predictfun import PredictFunClient
 from .config import load_config, validate_config
 from .engine.arbitrage import ArbitrageEngine
 from .engine.executor import OrderExecutor
@@ -24,7 +24,7 @@ class ArbitrageRunner:
         self.config = None
         self.logger = None
         self.pm_client = None
-        self.op_client = None
+        self.pf_client = None
         self.engine = None
         self.executor = None
 
@@ -41,7 +41,7 @@ class ArbitrageRunner:
         )
 
         self.logger.info("=" * 60)
-        self.logger.info("Polymarket-Opinion Arbitrage System")
+        self.logger.info("Polymarket-Predict.fun Arbitrage System")
         self.logger.info("=" * 60)
 
         # Validate configuration
@@ -59,14 +59,14 @@ class ArbitrageRunner:
         # Initialize clients
         self.logger.info("Initializing clients...")
         self.pm_client = PolymarketClient(self.config)
-        self.op_client = OpinionClient(self.config)
+        self.pf_client = PredictFunClient(self.config)
 
         # Initialize engine and executor
         self.engine = ArbitrageEngine(self.config)
         self.executor = OrderExecutor(
             self.config,
             self.pm_client,
-            self.op_client,
+            self.pf_client,
         )
 
         self.logger.info("Setup complete")
@@ -78,7 +78,7 @@ class ArbitrageRunner:
 
         # Connect clients
         await self.pm_client.connect()
-        await self.op_client.connect()
+        await self.pf_client.connect()
 
         # Subscribe to markets
         for market in self.config.markets:
@@ -87,13 +87,14 @@ class ArbitrageRunner:
 
             self.logger.info(f"Subscribing to market: {market.name}")
 
-            # Subscribe Polymarket tokens
-            await self.pm_client.subscribe_orderbook(
-                market.polymarket.yes_token_id
-            )
-            await self.pm_client.subscribe_orderbook(
-                market.polymarket.no_token_id
-            )
+            # Subscribe Polymarket tokens (if configured)
+            if market.polymarket:
+                await self.pm_client.subscribe_orderbook(
+                    market.polymarket.yes_token_id
+                )
+                await self.pm_client.subscribe_orderbook(
+                    market.polymarket.no_token_id
+                )
 
         self.logger.info("Connected to all platforms")
 
@@ -101,7 +102,7 @@ class ArbitrageRunner:
         """Disconnect from all platforms."""
         self.logger.info("Disconnecting...")
         await self.pm_client.disconnect()
-        await self.op_client.disconnect()
+        await self.pf_client.disconnect()
         self.logger.info("Disconnected")
 
     async def run_loop(self) -> None:
@@ -115,6 +116,10 @@ class ArbitrageRunner:
                     if not market.enabled:
                         continue
 
+                    # Skip if either platform is not configured
+                    if not market.polymarket or not market.predict_fun:
+                        continue
+
                     # Get Polymarket orderbooks (from WebSocket cache)
                     pm_yes = await self.pm_client.get_orderbook(
                         market.polymarket.yes_token_id
@@ -123,23 +128,25 @@ class ArbitrageRunner:
                         market.polymarket.no_token_id
                     )
 
-                    # Get Opinion orderbooks (REST fetch)
-                    op_yes, op_no = await asyncio.gather(
-                        self.op_client.fetch_orderbook(
-                            market.opinion.yes_token_id
+                    # Get Predict.fun orderbooks (REST fetch)
+                    pf_yes, pf_no = await asyncio.gather(
+                        self.pf_client.fetch_orderbook(
+                            market.predict_fun.yes_token_id,
+                            market_id=market.predict_fun.market_id,
                         ),
-                        self.op_client.fetch_orderbook(
-                            market.opinion.no_token_id
+                        self.pf_client.fetch_orderbook(
+                            market.predict_fun.no_token_id,
+                            market_id=market.predict_fun.market_id,
                         ),
                     )
 
-                    # Check for arbitrage opportunity
-                    opportunity = self.engine.check_arbitrage(
+                    # Check for arbitrage opportunity (PM ⟷ PF)
+                    opportunity = self.engine.check_arbitrage_pm_pf(
                         market,
                         pm_yes,
                         pm_no,
-                        op_yes,
-                        op_no,
+                        pf_yes,
+                        pf_no,
                     )
 
                     if opportunity:

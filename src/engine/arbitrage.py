@@ -20,13 +20,10 @@ class ArbitrageEngine:
         self.min_size = config.arbitrage.min_position_size
         self.freshness_ms = config.arbitrage.price_freshness_ms
 
-        # Calculate total fees
-        self.pm_fee = config.fees.polymarket.taker_fee
-        self.pm_gas = config.fees.polymarket.gas_estimate
-        self.op_fee = config.fees.opinion.taker_fee
-        self.op_gas = config.fees.opinion.gas_estimate
-        self.pf_fee = config.fees.predict_fun.taker_fee
-        self.pf_gas = config.fees.predict_fun.gas_estimate
+        # Taker fees (CLOB 交易无 gas)
+        self.pm_fee = config.fees.polymarket.taker_fee  # 0%
+        self.op_fee = config.fees.opinion.taker_fee      # 1%
+        self.pf_fee = config.fees.predict_fun.taker_fee  # 2%
 
     def check_arbitrage(
         self,
@@ -101,14 +98,12 @@ class ArbitrageEngine:
         pm_price = pm_ob.best_ask
         op_price = op_ob.best_ask
 
-        # Calculate total cost
-        # Token cost + fees + gas
+        # Calculate total cost = token cost + taker fees
         token_cost = pm_price + op_price
         fee_cost = (pm_price * self.pm_fee) + (op_price * self.op_fee)
-        gas_cost = self.pm_gas + self.op_gas
 
         # Total cost per unit (normalized to 1.0 payout)
-        total_cost = token_cost + fee_cost + gas_cost
+        total_cost = token_cost + fee_cost
 
         # Check if profitable
         if total_cost >= 1.0:
@@ -155,7 +150,6 @@ class ArbitrageEngine:
         Calculate optimal position size considering:
         - Available liquidity (max_size)
         - Position size limits
-        - Expected profit vs fixed costs
         """
         # Start with max available
         size = opportunity.max_size
@@ -163,17 +157,6 @@ class ArbitrageEngine:
         # Apply position limits
         size = min(size, self.max_size)
         size = max(size, self.min_size)
-
-        # Calculate expected profit
-        expected_profit = (1.0 - opportunity.total_cost) * size
-        gas_cost = self.pm_gas + self.op_gas
-
-        # Ensure profit exceeds gas costs with margin
-        if expected_profit < gas_cost * 2:
-            # Reduce size or return minimum
-            self.logger.debug(
-                f"Profit {expected_profit:.4f} too close to gas {gas_cost:.4f}"
-            )
 
         return size
 
@@ -250,14 +233,12 @@ class ArbitrageEngine:
         pm_price = pm_ob.best_ask
         pf_price = pf_ob.best_ask
 
-        # Calculate total cost
-        # Token cost + fees + gas
+        # Calculate total cost = token cost + taker fees
         token_cost = pm_price + pf_price
         fee_cost = (pm_price * self.pm_fee) + (pf_price * self.pf_fee)
-        gas_cost = self.pm_gas + self.pf_gas
 
         # Total cost per unit (normalized to 1.0 payout)
-        total_cost = token_cost + fee_cost + gas_cost
+        total_cost = token_cost + fee_cost
 
         # Check if profitable
         if total_cost >= 1.0:

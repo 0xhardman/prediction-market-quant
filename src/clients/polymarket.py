@@ -62,9 +62,18 @@ class PolymarketClient(BaseClient):
                 funder=creds.proxy_address if creds.proxy_address else None,
             )
 
-            # Set API credentials
-            # 先派生一次获取正确的凭据对象
-            api_creds = self._clob_client.create_or_derive_api_creds()
+            # Set API credentials - 优先使用已配置的凭据
+            if creds.api_key and creds.api_secret and creds.api_passphrase:
+                from py_clob_client.clob_types import ApiCreds
+                api_creds = ApiCreds(
+                    api_key=creds.api_key,
+                    api_secret=creds.api_secret,
+                    api_passphrase=creds.api_passphrase,
+                )
+                self.logger.info(f"Using configured API credentials (key: {creds.api_key[:20]}...)")
+            else:
+                api_creds = self._clob_client.create_or_derive_api_creds()
+                self.logger.info("Derived new API credentials")
             self._clob_client.set_api_creds(api_creds)
 
             self.logger.info("Polymarket CLOB client initialized")
