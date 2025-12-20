@@ -25,6 +25,8 @@ class ArbitrageEngine:
         self.pm_gas = config.fees.polymarket.gas_estimate
         self.op_fee = config.fees.opinion.taker_fee
         self.op_gas = config.fees.opinion.gas_estimate
+        self.pf_fee = config.fees.predict_fun.taker_fee
+        self.pf_gas = config.fees.predict_fun.gas_estimate
 
     def check_arbitrage(
         self,
@@ -174,3 +176,122 @@ class ArbitrageEngine:
             )
 
         return size
+
+    def check_arbitrage_pm_pf(
+        self,
+        market: MarketPair,
+        pm_yes: Optional[Orderbook],
+        pm_no: Optional[Orderbook],
+        pf_yes: Optional[Orderbook],
+        pf_no: Optional[Orderbook],
+    ) -> Optional[ArbitrageOpportunity]:
+        """
+        Check for arbitrage opportunities between Polymarket and Predict.fun.
+
+        Direction 1: PM_YES + PF_NO (Buy Yes on PM, Buy No on Predict.fun)
+        Direction 2: PM_NO + PF_YES (Buy No on PM, Buy Yes on Predict.fun)
+
+        Returns the most profitable opportunity if above threshold.
+        """
+        opportunities = []
+
+        # Check data freshness
+        orderbooks = [pm_yes, pm_no, pf_yes, pf_no]
+        if not all(orderbooks):
+            self.logger.debug(f"Missing orderbook data for {market.name}")
+            return None
+
+        for ob in orderbooks:
+            if not ob.is_fresh(self.freshness_ms):
+                self.logger.debug(f"Stale orderbook for {ob.token_id}")
+                return None
+
+        # Direction 1: PM Yes + PF No
+        opp1 = self._check_direction_pm_pf(
+            market=market,
+            direction=Direction.PM_YES_PF_NO,
+            pm_ob=pm_yes,
+            pf_ob=pf_no,
+        )
+        if opp1:
+            opportunities.append(opp1)
+
+        # Direction 2: PM No + PF Yes
+        opp2 = self._check_direction_pm_pf(
+            market=market,
+            direction=Direction.PM_NO_PF_YES,
+            pm_ob=pm_no,
+            pf_ob=pf_yes,
+        )
+        if opp2:
+            opportunities.append(opp2)
+
+        # Return the most profitable opportunity
+        if opportunities:
+            best = max(opportunities, key=lambda x: x.profit_pct)
+            self.logger.info(
+                f"Arbitrage found: {market.name} | {best.direction.value} | "
+                f"PM={best.pm_price:.4f} PF={best.pf_price:.4f} | "
+                f"Profit={best.profit_pct:.2%}"
+            )
+            return best
+
+        return None
+
+    def _check_direction_pm_pf(
+        self,
+        market: MarketPair,
+        direction: Direction,
+        pm_ob: Orderbook,
+        pf_ob: Orderbook,
+    ) -> Optional[ArbitrageOpportunity]:
+        """Check a single arbitrage direction for PM ⟷ PF."""
+        # We're buying at ask prices
+        pm_price = pm_ob.best_ask
+        pf_price = pf_ob.best_ask
+
+        # Calculate total cost
+        # Token cost + fees + gas
+        token_cost = pm_price + pf_price
+        fee_cost = (pm_price * self.pm_fee) + (pf_price * self.pf_fee)
+        gas_cost = self.pm_gas + self.pf_gas
+
+        # Total cost per unit (normalized to 1.0 payout)
+        total_cost = token_cost + fee_cost + gas_cost
+
+        # Check if profitable
+        if total_cost >= 1.0:
+            return None
+
+        # Calculate profit percentage
+        profit_pct = (1.0 - total_cost) / total_cost
+
+        # Check minimum profit threshold
+        if profit_pct < self.min_profit:
+            return None
+
+        # Calculate max size based on orderbook depth
+        max_size = min(
+            pm_ob.ask_size,
+            pf_ob.ask_size,
+            self.max_size,
+        )
+
+        # Check minimum size
+        if max_size < self.min_size:
+            self.logger.debug(
+                f"Size too small: {max_size:.2f} < {self.min_size:.2f}"
+            )
+            return None
+
+        return ArbitrageOpportunity(
+            market_name=market.name,
+            direction=direction,
+            pm_token=pm_ob.token_id,
+            pf_token=pf_ob.token_id,
+            pm_price=pm_price,
+            pf_price=pf_price,
+            total_cost=total_cost,
+            profit_pct=profit_pct,
+            max_size=max_size,
+        )

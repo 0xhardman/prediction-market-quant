@@ -58,7 +58,7 @@ class PolymarketClient(BaseClient):
                 self.REST_URL,
                 key=creds.private_key,
                 chain_id=137,  # Polygon
-                signature_type=1,
+                signature_type=2,  # POLY_GNOSIS_SAFE
                 funder=creds.proxy_address if creds.proxy_address else None,
             )
 

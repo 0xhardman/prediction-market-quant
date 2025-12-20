@@ -74,12 +74,14 @@ class ArbitrageOpportunity:
     market_name: str
     direction: Direction
     pm_token: str            # Polymarket token to buy
-    op_token: str            # Opinion token to buy
-    pm_price: float          # Polymarket price
-    op_price: float          # Opinion price
-    total_cost: float        # Total cost per unit
-    profit_pct: float        # Profit percentage
-    max_size: float          # Maximum size based on orderbook depth
+    op_token: str = ""       # Opinion token to buy (optional for PM-PF arb)
+    pf_token: str = ""       # Predict.fun token to buy (optional for PM-OP arb)
+    pm_price: float = 0.0    # Polymarket price
+    op_price: float = 0.0    # Opinion price (optional)
+    pf_price: float = 0.0    # Predict.fun price (optional)
+    total_cost: float = 0.0  # Total cost per unit
+    profit_pct: float = 0.0  # Profit percentage
+    max_size: float = 0.0    # Maximum size based on orderbook depth
     timestamp: float = field(default_factory=time.time)
 
     @property

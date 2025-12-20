@@ -1200,6 +1200,7 @@ dependencies = [
     { name = "aiolimiter" },
     { name = "httpx" },
     { name = "opinion-clob-sdk" },
+    { name = "predict-sdk" },
     { name = "py-clob-client" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -1211,6 +1212,7 @@ requires-dist = [
     { name = "aiolimiter", specifier = ">=1.1.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "opinion-clob-sdk", specifier = ">=0.4.0" },
+    { name = "predict-sdk", specifier = ">=0.0.6" },
     { name = "py-clob-client", specifier = ">=0.15.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -1229,6 +1231,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/39/18/9fc1be6ac78bff14f56b88dedd019b2a669a5ff570cc40f055dccef294fe/poly_eip712_structs-0.0.1.tar.gz", hash = "sha256:d9193766fde497b1ee01c79a50092733a34b7a94bed090deb5d3c1b1e41f6d8c", size = 18091 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5a/d7/ff1cfba1c3a3d5d6851d7bef5e4ad19710ed6d03e149dc183111d103acab/poly_eip712_structs-0.0.1-py3-none-any.whl", hash = "sha256:11e714e8c25c64d22dcb8a606c87cf052e7154caf701652d29687ddaf7dee342", size = 12380 },
+]
+
+[[package]]
+name = "predict-sdk"
+version = "0.0.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "eth-abi" },
+    { name = "eth-account" },
+    { name = "eth-typing" },
+    { name = "web3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ef/12/203fdfae51624554bcfd6018534893360568689e8485aae44f3c958c9a9f/predict_sdk-0.0.6.tar.gz", hash = "sha256:d82939360cd4e83c9aae6d017181e15a342b811792c6a9b407386e43afa51dcb", size = 36795 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/20/cb/8091308a1508497c7ff5fefbb9f55e24c01ec132256d601fa982d4b33fef/predict_sdk-0.0.6-py3-none-any.whl", hash = "sha256:abe786190634f1d8e5aad70c1f74946b82471264ecfbd86beaaf625010f78bf0", size = 37895 },
 ]
 
 [[package]]
