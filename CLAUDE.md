@@ -35,33 +35,6 @@ uv run python scripts/generate_pm_creds.py
 uv run python scripts/pm_market_lookup.py "https://polymarket.com/event/..."
 ```
 
-## Architecture
-
-### Core Flow
-1. `ArbitrageRunner` (src/main.py) orchestrates the system
-2. Platform clients fetch orderbooks: PM uses WebSocket, Opinion/Predict.fun use REST polling
-3. `ArbitrageEngine` (src/engine/arbitrage.py) detects opportunities across platform pairs
-4. `OrderExecutor` (src/engine/executor.py) executes trades with mixed strategy (PM FOK + others aggressive limit)
-
-### Platform Clients (src/clients/)
-All inherit from `BaseClient` abstract class with `connect()`, `get_orderbook()`, `place_order()`, `cancel_order()`.
-
-- **PolymarketClient**: WebSocket for orderbooks, py-clob-client for trading. Uses `signature_type=2` (POLY_GNOSIS_SAFE). Minimum order size is 5.
-- **OpinionClient**: REST polling via opinion-clob-sdk
-- **PredictFunClient**: REST with JWT auth. Auth field is `signer` (not `walletAddress`). Uses market_id (not token_id) for orderbook requests.
-
-### Data Models (src/models.py)
-- `Orderbook`: Cached orderbook with freshness check
-- `ArbitrageOpportunity`: Detected opportunity with platform pair, direction, prices, profit
-- `Direction` enum: `PM_YES_OP_NO`, `PM_NO_OP_YES`, `PM_YES_PF_NO`, `PM_NO_PF_YES`, `OP_YES_PF_NO`, `OP_NO_PF_YES`
-
-### Configuration (src/config.py)
-Loads from `config.yaml` with `${ENV_VAR}` expansion. Defines:
-- Market pairs with token IDs for each platform
-- Platform fees (PM 0%, Opinion 1%, Predict.fun 2%)
-- Arbitrage thresholds (min profit, position limits, freshness)
-- Credentials from environment variables
-
 ## Key Implementation Details
 
 ### Arbitrage Detection
