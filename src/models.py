@@ -10,6 +10,7 @@ class Platform(str, Enum):
     """Supported platforms."""
     POLYMARKET = "polymarket"
     OPINION = "opinion"
+    PREDICT_FUN = "predict_fun"
 
 
 class Side(str, Enum):
@@ -20,8 +21,15 @@ class Side(str, Enum):
 
 class Direction(str, Enum):
     """Arbitrage direction."""
+    # Polymarket ⟷ Opinion
     PM_YES_OP_NO = "PM_YES_OP_NO"   # Buy Yes on Polymarket, Buy No on Opinion
     PM_NO_OP_YES = "PM_NO_OP_YES"   # Buy No on Polymarket, Buy Yes on Opinion
+    # Polymarket ⟷ Predict.fun
+    PM_YES_PF_NO = "PM_YES_PF_NO"   # Buy Yes on Polymarket, Buy No on Predict.fun
+    PM_NO_PF_YES = "PM_NO_PF_YES"   # Buy No on Polymarket, Buy Yes on Predict.fun
+    # Opinion ⟷ Predict.fun
+    OP_YES_PF_NO = "OP_YES_PF_NO"   # Buy Yes on Opinion, Buy No on Predict.fun
+    OP_NO_PF_YES = "OP_NO_PF_YES"   # Buy No on Opinion, Buy Yes on Predict.fun
 
 
 class OrderStatus(str, Enum):

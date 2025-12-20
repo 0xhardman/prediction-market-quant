@@ -27,12 +27,21 @@ class OpinionMarket:
 
 
 @dataclass
+class PredictFunMarket:
+    """Predict.fun market configuration."""
+    market_id: int = 0
+    yes_token_id: str = ""
+    no_token_id: str = ""
+
+
+@dataclass
 class MarketPair:
     """A pair of matched markets across platforms."""
     name: str
     enabled: bool
-    polymarket: PolymarketMarket
-    opinion: OpinionMarket
+    polymarket: Optional[PolymarketMarket] = None
+    opinion: Optional[OpinionMarket] = None
+    predict_fun: Optional[PredictFunMarket] = None
 
 
 @dataclass
@@ -59,6 +68,7 @@ class FeesConfig:
     """Combined fees configuration."""
     polymarket: PlatformFees = field(default_factory=PlatformFees)
     opinion: PlatformFees = field(default_factory=lambda: PlatformFees(taker_fee=0.01, gas_estimate=0.10))
+    predict_fun: PlatformFees = field(default_factory=lambda: PlatformFees(taker_fee=0.02, gas_estimate=0.10))
 
 
 @dataclass
@@ -88,10 +98,17 @@ class OpinionCredentials:
 
 
 @dataclass
+class PredictFunCredentials:
+    """Predict.fun API credentials."""
+    api_key: str = ""
+
+
+@dataclass
 class CredentialsConfig:
     """Combined credentials configuration."""
     polymarket: PolymarketCredentials = field(default_factory=PolymarketCredentials)
     opinion: OpinionCredentials = field(default_factory=OpinionCredentials)
+    predict_fun: PredictFunCredentials = field(default_factory=PredictFunCredentials)
 
 
 @dataclass
@@ -158,19 +175,39 @@ def load_config(config_path: str = "config.yaml") -> Config:
     for m in config_data.get("markets", []):
         pm = m.get("polymarket", {})
         op = m.get("opinion", {})
-        markets.append(MarketPair(
-            name=m.get("name", ""),
-            enabled=m.get("enabled", False),
-            polymarket=PolymarketMarket(
+        pf = m.get("predict_fun", {})
+
+        # Parse platform configs (None if not configured)
+        pm_market = None
+        if pm and pm.get("condition_id"):
+            pm_market = PolymarketMarket(
                 condition_id=pm.get("condition_id", ""),
                 yes_token_id=pm.get("yes_token_id", ""),
                 no_token_id=pm.get("no_token_id", ""),
-            ),
-            opinion=OpinionMarket(
+            )
+
+        op_market = None
+        if op and op.get("market_id"):
+            op_market = OpinionMarket(
                 market_id=op.get("market_id", 0),
                 yes_token_id=op.get("yes_token_id", ""),
                 no_token_id=op.get("no_token_id", ""),
-            ),
+            )
+
+        pf_market = None
+        if pf and pf.get("market_id"):
+            pf_market = PredictFunMarket(
+                market_id=pf.get("market_id", 0),
+                yes_token_id=pf.get("yes_token_id", ""),
+                no_token_id=pf.get("no_token_id", ""),
+            )
+
+        markets.append(MarketPair(
+            name=m.get("name", ""),
+            enabled=m.get("enabled", False),
+            polymarket=pm_market,
+            opinion=op_market,
+            predict_fun=pf_market,
         ))
 
     # Parse arbitrage config
@@ -189,6 +226,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
     fees_data = config_data.get("fees", {})
     pm_fees = fees_data.get("polymarket", {})
     op_fees = fees_data.get("opinion", {})
+    pf_fees = fees_data.get("predict_fun", {})
     fees = FeesConfig(
         polymarket=PlatformFees(
             taker_fee=pm_fees.get("taker_fee", 0.0),
@@ -197,6 +235,10 @@ def load_config(config_path: str = "config.yaml") -> Config:
         opinion=PlatformFees(
             taker_fee=op_fees.get("taker_fee", 0.01),
             gas_estimate=op_fees.get("gas_estimate", 0.10),
+        ),
+        predict_fun=PlatformFees(
+            taker_fee=pf_fees.get("taker_fee", 0.02),
+            gas_estimate=pf_fees.get("gas_estimate", 0.10),
         ),
     )
 
@@ -213,6 +255,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
     creds_data = config_data.get("credentials", {})
     pm_creds = creds_data.get("polymarket", {})
     op_creds = creds_data.get("opinion", {})
+    pf_creds = creds_data.get("predict_fun", {})
     credentials = CredentialsConfig(
         polymarket=PolymarketCredentials(
             private_key=pm_creds.get("private_key", ""),
@@ -224,6 +267,9 @@ def load_config(config_path: str = "config.yaml") -> Config:
         opinion=OpinionCredentials(
             api_key=op_creds.get("api_key", ""),
             private_key=op_creds.get("private_key", ""),
+        ),
+        predict_fun=PredictFunCredentials(
+            api_key=pf_creds.get("api_key", ""),
         ),
     )
 

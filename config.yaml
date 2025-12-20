@@ -1,6 +1,8 @@
-# Polymarket-Opinion 套利系统配置文件
+# 多平台预测市场套利系统配置文件
+# 支持: Polymarket, Opinion, Predict.fun
 
 # 市场映射表 - 手动配置相同赌局的token对应关系
+# 支持任意两个或三个平台的配对
 markets:
   # 示例配置，需要替换为实际的token ID
   - name: "示例市场"
@@ -10,6 +12,10 @@ markets:
       yes_token_id: "0x..."
       no_token_id: "0x..."
     opinion:
+      market_id: 0
+      yes_token_id: "0x..."
+      no_token_id: "0x..."
+    predict_fun:
       market_id: 0
       yes_token_id: "0x..."
       no_token_id: "0x..."
@@ -32,6 +38,9 @@ fees:
   opinion:
     taker_fee: 0.01              # Opinion交易费 1% (保守估计)
     gas_estimate: 0.10           # BNB Chain gas ~$0.10
+  predict_fun:
+    taker_fee: 0.02              # Predict.fun交易费 2% (feeRateBps: 200)
+    gas_estimate: 0.10           # BNB Chain gas ~$0.10
 
 # 监控配置
 monitoring:
@@ -51,6 +60,8 @@ credentials:
   opinion:
     api_key: "${OPINION_API_KEY}"
     private_key: "${OPINION_PRIVATE_KEY}"
+  predict_fun:
+    api_key: "${PREDICT_FUN_API_KEY}"
 
 # 代理配置 (Opinion地区限制)
 proxy:

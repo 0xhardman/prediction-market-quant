@@ -1,13 +1,21 @@
 # PM Arbitrage
 
-Polymarket-Opinion 跨平台预测市场套利系统。
+多平台预测市场套利系统，支持 Polymarket、Opinion、Predict.fun 三方互套。
+
+## 支持平台
+
+| 平台 | 链 | 数据获取 | Taker Fee |
+|------|-----|---------|-----------|
+| Polymarket | Polygon | WebSocket | 0% |
+| Opinion | BNB Chain | REST | 1% |
+| Predict.fun | BNB Chain | REST | 2% |
 
 ## 功能特点
 
-- 实时监控 Polymarket 和 Opinion 两个平台的订单簿
+- 实时监控三个平台的订单簿
 - 自动检测互补 outcome 套利机会 (Yes+No < 1)
-- 双向检查 (PM_Yes+OP_No 和 PM_No+OP_Yes)
-- 混合执行策略: Polymarket FOK + Opinion 激进限价单
+- 支持任意两个平台配对套利
+- 混合执行策略: Polymarket FOK + 其他平台激进限价单
 - 风险控制: 敞口限制、价格新鲜度检查、超时取消
 
 ## 安装
@@ -86,6 +94,9 @@ uv run python scripts/test_pm_connection.py
 
 # 测试 Opinion 连接
 uv run python scripts/test_opinion_connection.py
+
+# 测试 Predict.fun 连接
+uv run python scripts/test_pf_connection.py
 ```
 
 ## 项目结构
@@ -99,14 +110,16 @@ pm-quant/dashboard/
 │   ├── generate_pm_creds.py    # PM 凭据生成
 │   ├── pm_market_lookup.py     # 市场查询工具
 │   ├── test_pm_connection.py   # PM 连接测试
-│   └── test_opinion_connection.py  # Opinion 连接测试
+│   ├── test_opinion_connection.py  # Opinion 连接测试
+│   └── test_pf_connection.py   # Predict.fun 连接测试
 ├── src/
 │   ├── main.py             # 入口
 │   ├── config.py           # 配置加载
 │   ├── models.py           # 数据模型
 │   ├── clients/
 │   │   ├── polymarket.py   # Polymarket 客户端
-│   │   └── opinion.py      # Opinion 客户端
+│   │   ├── opinion.py      # Opinion 客户端
+│   │   └── predictfun.py   # Predict.fun 客户端
 │   ├── engine/
 │   │   ├── arbitrage.py    # 套利检测
 │   │   └── executor.py     # 订单执行
