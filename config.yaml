@@ -8,9 +8,9 @@ markets:
   - name: "Will Bitcoin reach $100,000 by December 31, 2025?"
     enabled: true # 设为true启用
     polymarket:
-      condition_id: "0xd3cfc885ca1a482af4057f39937398fa5adc7a0b61e2381956384af1bf59ce6f"
-      yes_token_id: "92530351746682701626081429271272191534203523777966250895862560038889741880940"
-      no_token_id: "15002165665234016876486282630507392757515779060349352387653810600083538604826"
+      condition_id: "0x1dc68761b70b8c60f238570d2667d1b14222edcd864f211fee6147c993bf95c1"
+      yes_token_id: "53547563821797767320703203165448448381039533604866540872125540272215686760016"
+      no_token_id: "27272913127863185442314909407204098155732736443514622284962647557773539496970"
     predict_fun:
       market_id: 415
       yes_token_id: "14862668150972542930258837689755111839426102234146323070055218172124000064169"
@@ -58,8 +58,8 @@ credentials:
     private_key: "${OPINION_PRIVATE_KEY}"
   predict_fun:
     api_key: "${PREDICT_FUN_API_KEY}"
-    private_key: "${PREDICT_FUN_PRIVATE_KEY}"  # Privy 钱包私钥
-    smart_wallet: "${PREDICT_FUN_SMART_WALLET}"  # Smart Wallet 地址 (maker)
+    private_key: "${PREDICT_FUN_PRIVATE_KEY}" # Privy 钱包私钥
+    smart_wallet: "${PREDICT_FUN_SMART_WALLET}" # Smart Wallet 地址 (maker)
 
 # 代理配置 (Opinion地区限制)
 proxy:
