@@ -62,3 +62,16 @@ class Order:
     def remaining_size(self) -> float:
         """Remaining unfilled size."""
         return self.size - self.filled_size
+
+
+@dataclass
+class Trade:
+    """Trade execution information."""
+    id: str
+    order_id: str
+    token_id: str
+    side: Side
+    price: float
+    size: float
+    fee: float = 0.0
+    timestamp: float = field(default_factory=time)

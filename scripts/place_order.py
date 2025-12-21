@@ -353,14 +353,17 @@ class OrderWizard:
 
         # Size
         print()
-        if self.platform == "pm":
+        if self.order_type == "market" and self.side == Side.BUY:
+            # Market BUY: allow $ value or shares
+            print("  For BUY: enter $ value (e.g., $10) or shares")
+            if self.platform == "pm":
+                size_str = self.get_input("Amount", "$5")
+            else:
+                size_str = self.get_input("Amount", "$1")
+        elif self.platform == "pm":
             size_str = self.get_input("Size (shares, min 5)", "5")
         else:
-            if self.side == Side.BUY:
-                print("  For BUY: enter $ value (e.g., $10) or shares")
-                size_str = self.get_input("Amount", "$1")
-            else:
-                size_str = self.get_input("Size (shares)", "100")
+            size_str = self.get_input("Size (shares)", "100")
 
         if size_str in ("q", "b"):
             return size_str
@@ -439,9 +442,16 @@ class OrderWizard:
         async with PolymarketClient(token_id=self.token_id) as client:
             print("\n  Connected to Polymarket")
 
-            # Get balance
+            # Get balance and position
             balance_before = await client.get_balance()
-            print(f"  Balance: {balance_before:.4f} USDC")
+            position = await client.get_position()
+            print(f"  USDC Balance: {balance_before:.4f}")
+            print(f"  Token Position: {position:.4f} shares")
+
+            # Check if selling more than held
+            if self.side == Side.SELL and self.size > position:
+                print(f"\n  ERROR: Cannot sell {self.size} shares, only holding {position:.4f}")
+                return "q"
 
             # Get orderbook for display
             ob = await client.get_orderbook()
@@ -449,32 +459,36 @@ class OrderWizard:
             print(f"  Best Ask: {ob.best_ask:.4f}" if ob.best_ask else "  Best Ask: None")
 
             if self.order_type == "market":
-                # Market order: client auto-fetches price
-                order_type_str = "FOK"
-                print(f"\n  Placing {order_type_str} {self.side.value} order...")
-                print(f"    {self.size} shares (market price)")
-
-                order = await client.place_order(
-                    side=self.side,
-                    size=self.size,
-                    order_type=order_type_str,
-                )
+                # Market order using place_market_order
+                print(f"\n  Placing MARKET {self.side.value} order...")
+                if self.value:
+                    print(f"    Value: ${self.value:.2f}")
+                    order = await client.place_market_order(
+                        side=self.side,
+                        value=self.value,
+                    )
+                else:
+                    print(f"    Size: {self.size} shares")
+                    order = await client.place_market_order(
+                        side=self.side,
+                        size=self.size,
+                    )
             else:
                 # Limit order: use specified price
-                order_type_str = "GTC"
-                print(f"\n  Placing {order_type_str} {self.side.value} order...")
+                print(f"\n  Placing LIMIT {self.side.value} order...")
                 print(f"    {self.size} shares @ {self.price:.4f}")
 
                 order = await client.place_order(
                     side=self.side,
                     price=self.price,
                     size=self.size,
-                    order_type=order_type_str,
                 )
 
             print(f"\n  Order placed!")
             print(f"    ID: {order.id[:40]}...")
             print(f"    Status: {order.status.value}")
+            if order.price > 0:
+                print(f"    Price: {order.price:.4f}")
 
             balance_after = await client.get_balance()
             print(f"\n  Balance after: {balance_after:.4f} USDC")

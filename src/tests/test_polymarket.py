@@ -164,3 +164,99 @@ class TestPolymarketEdgeCases:
         assert client.is_connected
         await client.close()
         assert not client.is_connected
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+class TestPolymarketNewMethods:
+    """Test new methods added in refactoring."""
+
+    async def test_get_midpoint(self, pm_client):
+        """Test getting midpoint price."""
+        midpoint = await pm_client.get_midpoint()
+
+        # Midpoint can be None if no orders
+        if midpoint is not None:
+            assert isinstance(midpoint, float)
+            assert 0 <= midpoint <= 1
+
+    async def test_get_spread(self, pm_client):
+        """Test getting bid-ask spread."""
+        spread = await pm_client.get_spread()
+
+        # Spread can be None if no orders
+        if spread is not None:
+            assert isinstance(spread, float)
+            assert spread >= 0
+
+    async def test_get_trades(self, pm_client):
+        """Test getting trade history."""
+        trades = await pm_client.get_trades()
+
+        assert isinstance(trades, list)
+        # Trades may be empty, but structure should be correct
+        for trade in trades:
+            assert trade.id != ""
+            assert trade.side in (Side.BUY, Side.SELL)
+            assert trade.price >= 0
+            assert trade.size >= 0
+
+    async def test_get_order_nonexistent(self, pm_client):
+        """Test getting a non-existent order."""
+        order = await pm_client.get_order("nonexistent_order_id_12345")
+        assert order is None
+
+    async def test_cancel_all_empty(self, pm_client):
+        """Test cancel_all when no orders exist."""
+        # Should not raise, returns count
+        count = await pm_client.cancel_all()
+        assert isinstance(count, int)
+        assert count >= 0
+
+    async def test_place_and_get_order(self, pm_client):
+        """Test placing order and retrieving it."""
+        try:
+            # Place a low-price order
+            order = await pm_client.place_order(
+                side=Side.BUY,
+                price=0.01,
+                size=5.0,
+            )
+
+            # Try to get the order
+            fetched = await pm_client.get_order(order.id)
+            if fetched:
+                assert fetched.id == order.id
+                assert fetched.side == order.side
+
+            # Cleanup
+            await pm_client.cancel_order(order.id)
+
+        except OrderRejectedError as e:
+            pytest.skip(f"Order rejected: {e.reason}")
+
+    async def test_batch_cancel_orders(self, pm_client):
+        """Test batch cancel with empty list."""
+        results = await pm_client.cancel_orders([])
+        assert results == []
+
+    async def test_batch_place_and_cancel(self, pm_client):
+        """Test batch placing and cancelling orders."""
+        try:
+            # Place multiple orders in batch
+            orders = await pm_client.place_orders([
+                (Side.BUY, 0.01, 5.0),
+                (Side.BUY, 0.02, 5.0),
+            ])
+
+            assert len(orders) == 2
+            assert all(o.side == Side.BUY for o in orders)
+
+            # Cancel all created orders
+            order_ids = [o.id for o in orders if o.id]
+            if order_ids:
+                results = await pm_client.cancel_orders(order_ids)
+                assert len(results) == len(order_ids)
+
+        except OrderRejectedError as e:
+            pytest.skip(f"Order rejected: {e.reason}")

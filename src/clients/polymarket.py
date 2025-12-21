@@ -1,22 +1,32 @@
 """Polymarket client implementation."""
 
+import asyncio
 from time import time
 
 import httpx
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, OrderArgs, OrderType
+from py_clob_client.clob_types import (
+    ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    MarketOrderArgs,
+    OrderArgs,
+    OrderType,
+    PostOrdersArgs,
+)
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .base import BaseClient
 from ..config import PolymarketConfig
 from ..exceptions import (
     ConnectionError,
+    InsufficientBalanceError,
     NotConnectedError,
     OrderNotFoundError,
     OrderRejectedError,
 )
 from ..logging import pm_logger as logger
-from ..models import Order, Orderbook, OrderStatus, Side
+from ..models import Order, Orderbook, OrderStatus, Side, Trade
 
 
 class PolymarketClient(BaseClient):
@@ -126,7 +136,7 @@ class PolymarketClient(BaseClient):
         side: Side,
         price: float,
         size: float,
-        order_type: str = "GTC",
+        order_type: OrderType = OrderType.GTC,
     ) -> Order:
         """Place an order in the bound market.
 
@@ -138,7 +148,6 @@ class PolymarketClient(BaseClient):
         """
         self._ensure_connected()
 
-        ot = getattr(OrderType, order_type, OrderType.GTC)
         logger.info(f"Placing order: {side.value} {size} @ {price} ({order_type})")
 
         order_side = BUY if side == Side.BUY else SELL
@@ -150,14 +159,12 @@ class PolymarketClient(BaseClient):
         )
 
         try:
-            signed_order = self._client.create_order(order_args)
-            resp = self._client.post_order(signed_order, ot)
+            signed_order = await asyncio.to_thread(self._client.create_order, order_args)
+            resp = await asyncio.to_thread(self._client.post_order, signed_order, order_type)
         except Exception as e:
             error_msg = str(e).lower()
             logger.error(f"Order placement failed: {e}")
             if "insufficient" in error_msg or "balance" in error_msg:
-                from ..exceptions import InsufficientBalanceError
-
                 raise InsufficientBalanceError() from e
             raise OrderRejectedError(str(e)) from e
 
@@ -184,7 +191,7 @@ class PolymarketClient(BaseClient):
         logger.info(f"Cancelling order: {order_id[:20]}...")
 
         try:
-            self._client.cancel(order_id)
+            await asyncio.to_thread(self._client.cancel, order_id)
             logger.info(f"Order cancelled: {order_id[:20]}...")
             return True
         except Exception as e:
@@ -201,7 +208,7 @@ class PolymarketClient(BaseClient):
 
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            result = self._client.get_balance_allowance(params)
+            result = await asyncio.to_thread(self._client.get_balance_allowance, params)
             # Result contains 'balance' field in wei (6 decimals for USDC)
             balance_str = result.get("balance", "0")
             balance = float(balance_str) / 1e6  # USDC has 6 decimals
@@ -211,12 +218,31 @@ class PolymarketClient(BaseClient):
             logger.error(f"Failed to get balance: {e}")
             raise
 
+    async def get_position(self) -> float:
+        """Get token position (shares held) for the bound market."""
+        self._ensure_connected()
+
+        try:
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=self.token_id,
+            )
+            result = await asyncio.to_thread(self._client.get_balance_allowance, params)
+            # Result contains 'balance' field in wei (6 decimals)
+            balance_str = result.get("balance", "0")
+            position = float(balance_str) / 1e6
+            logger.debug(f"Position: {position:.2f} shares")
+            return position
+        except Exception as e:
+            logger.error(f"Failed to get position: {e}")
+            raise
+
     async def get_orders(self) -> list[Order]:
         """Get list of open orders."""
         self._ensure_connected()
 
         try:
-            result = self._client.get_orders()
+            result = await asyncio.to_thread(self._client.get_orders)
             orders = []
 
             for o in result:
@@ -248,3 +274,238 @@ class PolymarketClient(BaseClient):
         except Exception as e:
             logger.error(f"Failed to get orders: {e}")
             raise
+
+    async def place_market_order(
+        self,
+        side: Side,
+        size: float | None = None,
+        value: float | None = None,
+    ) -> Order:
+        """Place a market order.
+
+        For BUY orders, specify value (USD amount to spend) or size (shares to buy).
+        For SELL orders, specify size (shares to sell).
+
+        Args:
+            side: BUY or SELL
+            size: Number of shares (required for SELL)
+            value: USD value to spend (BUY only, alternative to size)
+        """
+        self._ensure_connected()
+
+        # Validate parameters
+        if side == Side.BUY and size is None and value is None:
+            raise ValueError("BUY market order requires either size or value")
+        if side == Side.SELL and size is None:
+            raise ValueError("SELL market order requires size")
+
+        # For market orders, amount is $ for BUY, shares for SELL
+        if side == Side.BUY:
+            amount = value if value is not None else size
+        else:
+            amount = size
+
+        logger.info(f"Placing market order: {side.value} amount={amount}")
+
+        order_side = BUY if side == Side.BUY else SELL
+        order_args = MarketOrderArgs(
+            token_id=self.token_id,
+            amount=amount,
+            side=order_side,
+            order_type=OrderType.FOK,
+        )
+
+        try:
+            signed_order = await asyncio.to_thread(
+                self._client.create_market_order, order_args
+            )
+            resp = await asyncio.to_thread(
+                self._client.post_order, signed_order, OrderType.FOK
+            )
+        except Exception as e:
+            error_msg = str(e).lower()
+            logger.error(f"Market order failed: {e}")
+            if "insufficient" in error_msg or "balance" in error_msg:
+                raise InsufficientBalanceError() from e
+            raise OrderRejectedError(str(e)) from e
+
+        order_id = resp.get("orderID", "")
+        status_str = resp.get("status", "FILLED")
+
+        logger.info(f"Market order placed: id={order_id[:20]}... status={status_str}")
+
+        return Order(
+            id=order_id,
+            token_id=self.token_id,
+            side=side,
+            price=0.0,  # Market order, price determined by matching
+            size=size or value or 0.0,
+            status=OrderStatus.FILLED,
+        )
+
+    async def place_orders(
+        self,
+        orders: list[tuple[Side, float, float]],
+    ) -> list[Order]:
+        """Place multiple orders in batch.
+
+        Args:
+            orders: List of (side, price, size) tuples.
+        """
+        self._ensure_connected()
+
+        logger.info(f"Placing {len(orders)} orders in batch")
+
+        # Create and sign all orders
+        signed_orders = []
+        for side, price, size in orders:
+            order_side = BUY if side == Side.BUY else SELL
+            order_args = OrderArgs(
+                price=price,
+                size=size,
+                side=order_side,
+                token_id=self.token_id,
+            )
+            signed = await asyncio.to_thread(self._client.create_order, order_args)
+            signed_orders.append(PostOrdersArgs(order=signed, orderType=OrderType.GTC))
+
+        try:
+            resp = await asyncio.to_thread(self._client.post_orders, signed_orders)
+        except Exception as e:
+            logger.error(f"Batch order placement failed: {e}")
+            raise OrderRejectedError(str(e)) from e
+
+        result = []
+        for i, (side, price, size) in enumerate(orders):
+            order_id = ""
+            if isinstance(resp, list) and i < len(resp):
+                order_id = resp[i].get("orderID", "")
+            result.append(
+                Order(
+                    id=order_id,
+                    token_id=self.token_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    status=OrderStatus.PENDING,
+                )
+            )
+
+        logger.info(f"Batch placed {len(result)} orders")
+        return result
+
+    async def cancel_orders(self, order_ids: list[str]) -> list[bool]:
+        """Cancel multiple orders in batch."""
+        self._ensure_connected()
+
+        logger.info(f"Cancelling {len(order_ids)} orders in batch")
+
+        try:
+            await asyncio.to_thread(self._client.cancel_orders, order_ids)
+            logger.info(f"Batch cancelled {len(order_ids)} orders")
+            return [True] * len(order_ids)
+        except Exception as e:
+            logger.warning(f"Batch cancel failed: {e}")
+            return [False] * len(order_ids)
+
+    async def cancel_all(self) -> int:
+        """Cancel all open orders."""
+        self._ensure_connected()
+
+        logger.info("Cancelling all orders")
+
+        try:
+            result = await asyncio.to_thread(self._client.cancel_all)
+            cancelled = result.get("canceled", []) if isinstance(result, dict) else []
+            count = len(cancelled) if isinstance(cancelled, list) else 0
+            logger.info(f"Cancelled {count} orders")
+            return count
+        except Exception as e:
+            logger.error(f"Cancel all failed: {e}")
+            raise
+
+    async def get_order(self, order_id: str) -> Order | None:
+        """Get a specific order by ID."""
+        self._ensure_connected()
+
+        try:
+            o = await asyncio.to_thread(self._client.get_order, order_id)
+            if not o:
+                return None
+
+            side_str = o.get("side", "BUY")
+            status_str = o.get("status", "OPEN")
+
+            return Order(
+                id=o.get("id", order_id),
+                token_id=o.get("asset_id", self.token_id),
+                side=Side.BUY if side_str == "BUY" else Side.SELL,
+                price=float(o.get("price", 0)),
+                size=float(o.get("original_size", 0)),
+                status=OrderStatus(status_str)
+                if status_str in OrderStatus.__members__
+                else OrderStatus.OPEN,
+                filled_size=float(o.get("size_matched", 0)),
+            )
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "not found" in error_msg:
+                return None
+            logger.error(f"Failed to get order: {e}")
+            raise
+
+    async def get_trades(self) -> list[Trade]:
+        """Get trade history."""
+        self._ensure_connected()
+
+        try:
+            result = await asyncio.to_thread(self._client.get_trades)
+            trades = []
+
+            for t in result:
+                trades.append(
+                    Trade(
+                        id=t.get("id", ""),
+                        order_id=t.get("order_id", ""),
+                        token_id=t.get("asset_id", ""),
+                        side=Side.BUY if t.get("side") == "BUY" else Side.SELL,
+                        price=float(t.get("price", 0)),
+                        size=float(t.get("size", 0)),
+                        fee=float(t.get("fee_rate_bps", 0)) / 10000,
+                        timestamp=float(t.get("created_at", 0)) / 1000
+                        if t.get("created_at")
+                        else time(),
+                    )
+                )
+
+            logger.debug(f"Retrieved {len(trades)} trades")
+            return trades
+        except Exception as e:
+            logger.error(f"Failed to get trades: {e}")
+            raise
+
+    async def get_midpoint(self) -> float | None:
+        """Get midpoint price for the bound market."""
+        self._ensure_connected()
+
+        try:
+            result = await asyncio.to_thread(self._client.get_midpoint, self.token_id)
+            if result and "mid" in result:
+                return float(result["mid"])
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get midpoint: {e}")
+            return None
+
+    async def get_spread(self) -> float | None:
+        """Get bid-ask spread for the bound market."""
+        self._ensure_connected()
+
+        try:
+            result = await asyncio.to_thread(self._client.get_spread, self.token_id)
+            if result and "spread" in result:
+                return float(result["spread"])
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get spread: {e}")
+            return None
