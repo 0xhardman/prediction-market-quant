@@ -52,6 +52,9 @@ PF_API = "https://api.predict.fun/v1"
 # Default markets
 DEFAULT_PF_MARKET_ID = int(os.getenv("PF_TEST_MARKET_ID", "415"))
 
+# PF API key
+PF_API_KEY = os.getenv("PREDICT_FUN_API_KEY", "")
+
 
 class OrderWizard:
     """Step-by-step order placement wizard."""
@@ -213,9 +216,10 @@ class OrderWizard:
             print("  Invalid market ID")
             return await self.step_market()
 
-        async with httpx.AsyncClient(timeout=15) as http:
+        headers = {"X-API-Key": PF_API_KEY} if PF_API_KEY else {}
+        async with httpx.AsyncClient(timeout=15, headers=headers, base_url=PF_API) as http:
             print("\n  Fetching market info...")
-            resp = await http.get(f"{PF_API}/markets/{market_id}")
+            resp = await http.get(f"/markets/{market_id}")
             if resp.status_code == 200:
                 data = resp.json().get("data", {})
                 outcomes = data.get("outcomes", [])
@@ -224,7 +228,8 @@ class OrderWizard:
                     "question": data.get("question", "Unknown"),
                     "tokens": [
                         {
-                            "token_id": o.get("tokenId", ""),
+                            # PF uses onChainId for token ID
+                            "token_id": o.get("onChainId") or o.get("tokenId", ""),
                             "outcome": o.get("name", f"Outcome {i}"),
                         }
                         for i, o in enumerate(outcomes)
@@ -625,9 +630,10 @@ async def run_cli(args):
     else:
         # PF
         market_id = int(args.market) if args.market else DEFAULT_PF_MARKET_ID
-        async with httpx.AsyncClient(timeout=15) as http:
+        headers = {"X-API-Key": PF_API_KEY} if PF_API_KEY else {}
+        async with httpx.AsyncClient(timeout=15, headers=headers, base_url=PF_API) as http:
             print(f"\n  Fetching market {market_id}...")
-            resp = await http.get(f"{PF_API}/markets/{market_id}")
+            resp = await http.get(f"/markets/{market_id}")
             if resp.status_code == 200:
                 data = resp.json().get("data", {})
                 outcomes = data.get("outcomes", [])
@@ -635,7 +641,11 @@ async def run_cli(args):
                     "market_id": market_id,
                     "question": data.get("question", "Unknown"),
                     "tokens": [
-                        {"token_id": o.get("tokenId", ""), "outcome": o.get("name", f"Outcome {i}")}
+                        {
+                            # PF uses onChainId for token ID
+                            "token_id": o.get("onChainId") or o.get("tokenId", ""),
+                            "outcome": o.get("name", f"Outcome {i}"),
+                        }
                         for i, o in enumerate(outcomes)
                     ],
                 }

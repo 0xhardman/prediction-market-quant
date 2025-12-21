@@ -25,7 +25,7 @@ from ..exceptions import (
     InsufficientBalanceError,
 )
 from ..logging import pf_logger as logger
-from ..models import Order, Orderbook, OrderStatus, Side
+from ..models import Order, Orderbook, OrderStatus, Side, Trade
 
 
 class PredictFunClient(BaseClient):
@@ -171,6 +171,10 @@ class PredictFunClient(BaseClient):
         bids = [(float(b[0]), float(b[1])) for b in book.get("bids", [])]
         asks = [(float(a[0]), float(a[1])) for a in book.get("asks", [])]
 
+        # Sort: bids descending (highest first), asks ascending (lowest first)
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+
         return Orderbook(bids=bids, asks=asks, timestamp=time())
 
     async def place_order(self, side: Side, price: float, size: float) -> Order:
@@ -269,7 +273,9 @@ class PredictFunClient(BaseClient):
             error_msg = result.get("message", "") or result.get("error", {}).get(
                 "description", ""
             )
+            # Log full response for debugging
             logger.error(f"Order placement failed: {error_msg}")
+            logger.debug(f"Full response: {result}")
             error_lower = error_msg.lower()
             if "insufficient" in error_lower or "collateral" in error_lower:
                 raise InsufficientBalanceError()
@@ -334,13 +340,35 @@ class PredictFunClient(BaseClient):
         orders = []
         for o in resp.json().get("data", []):
             order_data = o.get("order", {})
+
+            # side is numeric: 0=BUY, 1=SELL
+            side_num = order_data.get("side", 0)
+            side = Side.BUY if side_num == 0 else Side.SELL
+
+            # Calculate price from maker/taker amounts
+            maker_amount = float(order_data.get("makerAmount", 0))
+            taker_amount = float(order_data.get("takerAmount", 0))
+            if side == Side.BUY and taker_amount > 0:
+                # BUY: pay makerAmount USDT for takerAmount shares
+                price = maker_amount / taker_amount
+            elif side == Side.SELL and maker_amount > 0:
+                # SELL: sell makerAmount shares for takerAmount USDT
+                price = taker_amount / maker_amount
+            else:
+                price = 0.0
+
+            # Size from amount field (in wei)
+            size = float(o.get("amount", 0)) / 1e18
+            filled = float(o.get("amountFilled", 0)) / 1e18
+
             orders.append(
                 Order(
                     id=order_data.get("hash", ""),
                     token_id=order_data.get("tokenId", ""),
-                    side=Side.BUY if order_data.get("side") == "BUY" else Side.SELL,
-                    price=float(order_data.get("price", 0)),
-                    size=float(order_data.get("size", 0)),
+                    side=side,
+                    price=price,
+                    size=size,
+                    filled_size=filled,
                     status=OrderStatus.OPEN,
                 )
             )
@@ -485,3 +513,245 @@ class PredictFunClient(BaseClient):
             if "insufficient" in error_lower or "collateral" in error_lower:
                 raise InsufficientBalanceError()
             raise OrderRejectedError(error_msg)
+
+    async def place_orders(
+        self,
+        orders: list[tuple[Side, float, float]],
+    ) -> list[Order]:
+        """Place multiple orders in batch.
+
+        Note: SDK doesn't support native batch, so this loops through place_order.
+
+        Args:
+            orders: List of (side, price, size) tuples.
+
+        Returns:
+            List of Order objects.
+        """
+        self._ensure_connected()
+
+        logger.info(f"Placing {len(orders)} orders in batch")
+
+        results = []
+        for side, price, size in orders:
+            order = await self.place_order(side, price, size)
+            results.append(order)
+
+        logger.info(f"Batch placed {len(results)} orders")
+        return results
+
+    async def cancel_orders(self, order_ids: list[str]) -> list[bool]:
+        """Cancel multiple orders in batch.
+
+        Args:
+            order_ids: List of order hashes to cancel.
+
+        Returns:
+            List of success booleans for each order.
+        """
+        self._ensure_connected()
+        await self._ensure_valid_token()
+
+        if not order_ids:
+            return []
+
+        logger.info(f"Cancelling {len(order_ids)} orders in batch")
+
+        # Get all orders to find internal IDs
+        orders_resp = await self._http.get("/orders")
+        orders_resp.raise_for_status()
+        all_orders = orders_resp.json().get("data", [])
+
+        # Map hash -> internal ID
+        hash_to_id = {}
+        for o in all_orders:
+            order_hash = o.get("order", {}).get("hash", "")
+            internal_id = o.get("id")
+            if order_hash and internal_id:
+                hash_to_id[order_hash] = internal_id
+
+        # Find internal IDs for requested hashes
+        internal_ids = []
+        results = []
+        for order_id in order_ids:
+            if order_id in hash_to_id:
+                internal_ids.append(hash_to_id[order_id])
+                results.append(True)  # Will be updated after cancel
+            else:
+                results.append(False)
+
+        if not internal_ids:
+            return results
+
+        # Cancel all found orders
+        try:
+            cancel_resp = await self._http.post(
+                "/orders/remove", json={"data": {"ids": internal_ids}}
+            )
+            result = cancel_resp.json()
+            if result.get("success"):
+                logger.info(f"Batch cancelled {len(internal_ids)} orders")
+            else:
+                logger.warning(f"Batch cancel returned: {result}")
+                # Mark all as failed
+                results = [False] * len(order_ids)
+        except Exception as e:
+            logger.warning(f"Batch cancel failed: {e}")
+            results = [False] * len(order_ids)
+
+        return results
+
+    async def cancel_all(self) -> int:
+        """Cancel all open orders.
+
+        Returns:
+            Number of orders cancelled.
+        """
+        self._ensure_connected()
+
+        logger.info("Cancelling all orders")
+
+        orders = await self.get_orders()
+        if not orders:
+            logger.info("No orders to cancel")
+            return 0
+
+        order_ids = [o.id for o in orders if o.id]
+        results = await self.cancel_orders(order_ids)
+        count = sum(results)
+
+        logger.info(f"Cancelled {count} orders")
+        return count
+
+    async def get_order(self, order_id: str) -> Order | None:
+        """Get a specific order by hash.
+
+        Args:
+            order_id: The order hash.
+
+        Returns:
+            Order object or None if not found.
+        """
+        self._ensure_connected()
+
+        orders = await self.get_orders()
+        for o in orders:
+            if o.id == order_id:
+                return o
+        return None
+
+    async def get_trades(self) -> list[Trade]:
+        """Get trade history.
+
+        Returns:
+            List of Trade objects.
+        """
+        self._ensure_connected()
+        await self._ensure_valid_token()
+
+        try:
+            resp = await self._http.get("/fills")
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+
+            trades = []
+            for t in data:
+                trades.append(
+                    Trade(
+                        id=t.get("id", ""),
+                        order_id=t.get("orderId", ""),
+                        token_id=t.get("tokenId", str(self.token_id)),
+                        side=Side.BUY if t.get("side") == "BUY" else Side.SELL,
+                        price=float(t.get("price", 0)),
+                        size=float(t.get("size", 0)),
+                        fee=float(t.get("fee", 0)),
+                        timestamp=float(t.get("timestamp", 0)) / 1000
+                        if t.get("timestamp")
+                        else time(),
+                    )
+                )
+
+            logger.debug(f"Retrieved {len(trades)} trades")
+            return trades
+
+        except Exception as e:
+            # /fills endpoint may not exist, try alternative
+            logger.debug(f"Failed to get trades from /fills: {e}")
+            try:
+                resp = await self._http.get("/trades")
+                resp.raise_for_status()
+                data = resp.json().get("data", [])
+
+                trades = []
+                for t in data:
+                    trades.append(
+                        Trade(
+                            id=t.get("id", ""),
+                            order_id=t.get("orderId", ""),
+                            token_id=t.get("tokenId", str(self.token_id)),
+                            side=Side.BUY if t.get("side") == "BUY" else Side.SELL,
+                            price=float(t.get("price", 0)),
+                            size=float(t.get("size", 0)),
+                            fee=float(t.get("fee", 0)),
+                            timestamp=float(t.get("timestamp", 0)) / 1000
+                            if t.get("timestamp")
+                            else time(),
+                        )
+                    )
+
+                logger.debug(f"Retrieved {len(trades)} trades")
+                return trades
+
+            except Exception as e2:
+                logger.warning(f"Trade history not available: {e2}")
+                return []
+
+    async def get_midpoint(self) -> float | None:
+        """Get midpoint price for the bound market.
+
+        Returns:
+            Midpoint price or None if not available.
+        """
+        ob = await self.get_orderbook()
+        if ob.best_bid and ob.best_ask:
+            return (ob.best_bid + ob.best_ask) / 2
+        return None
+
+    async def get_spread(self) -> float | None:
+        """Get bid-ask spread for the bound market.
+
+        Returns:
+            Spread or None if not available.
+        """
+        ob = await self.get_orderbook()
+        if ob.best_bid and ob.best_ask:
+            return ob.best_ask - ob.best_bid
+        return None
+
+    async def get_position(self) -> float:
+        """Get token position (shares held) for the bound market.
+
+        Returns:
+            Number of shares held for the current token.
+        """
+        self._ensure_connected()
+        await self._ensure_valid_token()
+
+        try:
+            # Try REST API first
+            resp = await self._http.get("/positions")
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+
+            # Find position for our token
+            for pos in data:
+                if str(pos.get("tokenId")) == str(self.token_id):
+                    return float(pos.get("size", 0))
+
+            return 0.0
+
+        except Exception as e:
+            logger.debug(f"Failed to get position from /positions: {e}")
+            # Fallback: query ERC-1155 balance on-chain if needed
+            # For now, return 0 if API doesn't support
+            return 0.0
