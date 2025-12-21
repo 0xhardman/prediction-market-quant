@@ -129,6 +129,10 @@ class PolymarketClient(BaseClient):
         bids = [(float(b["price"]), float(b["size"])) for b in book.get("bids", [])]
         asks = [(float(a["price"]), float(a["size"])) for a in book.get("asks", [])]
 
+        # Sort: bids descending (highest first), asks ascending (lowest first)
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+
         return Orderbook(bids=bids, asks=asks, timestamp=time())
 
     async def place_order(
@@ -286,10 +290,14 @@ class PolymarketClient(BaseClient):
         For BUY orders, specify value (USD amount to spend) or size (shares to buy).
         For SELL orders, specify size (shares to sell).
 
+        Note: SDK's MarketOrderArgs.amount means:
+          - BUY: USD amount to spend
+          - SELL: shares to sell
+
         Args:
             side: BUY or SELL
-            size: Number of shares (required for SELL)
-            value: USD value to spend (BUY only, alternative to size)
+            size: Number of shares (for SELL, or converted to value for BUY)
+            value: USD value to spend (BUY only)
         """
         self._ensure_connected()
 
@@ -299,13 +307,25 @@ class PolymarketClient(BaseClient):
         if side == Side.SELL and size is None:
             raise ValueError("SELL market order requires size")
 
-        # For market orders, amount is $ for BUY, shares for SELL
+        # SDK amount semantics:
+        #   BUY: amount = USD to spend
+        #   SELL: amount = shares to sell
         if side == Side.BUY:
-            amount = value if value is not None else size
+            if value is not None:
+                # Direct USD value
+                amount = value
+                logger.info(f"Placing market BUY: ${value:.2f}")
+            else:
+                # Convert size (shares) to value (USD) using best ask
+                ob = await self.get_orderbook()
+                if not ob.best_ask:
+                    raise OrderRejectedError("No asks available for market buy")
+                amount = size * ob.best_ask
+                logger.info(f"Placing market BUY: {size} shares @ ~{ob.best_ask:.4f} = ${amount:.2f}")
         else:
+            # SELL: amount = shares
             amount = size
-
-        logger.info(f"Placing market order: {side.value} amount={amount}")
+            logger.info(f"Placing market SELL: {size} shares")
 
         order_side = BUY if side == Side.BUY else SELL
         order_args = MarketOrderArgs(
@@ -334,12 +354,27 @@ class PolymarketClient(BaseClient):
 
         logger.info(f"Market order placed: id={order_id[:20]}... status={status_str}")
 
+        # For BUY with size, we converted to value, so record original size
+        # For BUY with value, estimate size from value/price
+        # For SELL, size is the amount
+        if side == Side.BUY:
+            if size is not None:
+                order_size = size
+                order_price = amount / size  # estimated avg price
+            else:
+                # value-based buy, estimate size
+                order_size = amount  # will be updated after fill
+                order_price = 0.0
+        else:
+            order_size = size
+            order_price = 0.0
+
         return Order(
             id=order_id,
             token_id=self.token_id,
             side=side,
-            price=0.0,  # Market order, price determined by matching
-            size=size or value or 0.0,
+            price=order_price,
+            size=order_size,
             status=OrderStatus.FILLED,
         )
 

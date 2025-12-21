@@ -98,6 +98,65 @@ class TestPlaceMarketOrderValidation:
             await connected_client.place_market_order(Side.SELL, value=100)
 
 
+class TestOrderbookSorting:
+    """Test orderbook sorting behavior."""
+
+    @pytest.fixture
+    def connected_client(self):
+        client = PolymarketClient(token_id="test_token")
+        client._client = MagicMock()
+        client._http = MagicMock()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_orderbook_sorts_bids_descending(self, connected_client):
+        """Test that bids are sorted highest price first."""
+        # API returns bids in ascending order (0.01 -> 0.07)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "bids": [
+                {"price": "0.01", "size": "100"},
+                {"price": "0.03", "size": "50"},
+                {"price": "0.07", "size": "200"},
+            ],
+            "asks": [],
+        }
+        mock_response.raise_for_status = MagicMock()
+        connected_client._http.get = AsyncMock(return_value=mock_response)
+
+        ob = await connected_client.get_orderbook()
+
+        # Should be sorted descending: 0.07, 0.03, 0.01
+        assert ob.bids[0] == (0.07, 200.0)
+        assert ob.bids[1] == (0.03, 50.0)
+        assert ob.bids[2] == (0.01, 100.0)
+        assert ob.best_bid == 0.07
+
+    @pytest.mark.asyncio
+    async def test_orderbook_sorts_asks_ascending(self, connected_client):
+        """Test that asks are sorted lowest price first."""
+        # API returns asks in descending order (0.99 -> 0.08)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "bids": [],
+            "asks": [
+                {"price": "0.99", "size": "100"},
+                {"price": "0.50", "size": "75"},
+                {"price": "0.08", "size": "200"},
+            ],
+        }
+        mock_response.raise_for_status = MagicMock()
+        connected_client._http.get = AsyncMock(return_value=mock_response)
+
+        ob = await connected_client.get_orderbook()
+
+        # Should be sorted ascending: 0.08, 0.50, 0.99
+        assert ob.asks[0] == (0.08, 200.0)
+        assert ob.asks[1] == (0.50, 75.0)
+        assert ob.asks[2] == (0.99, 100.0)
+        assert ob.best_ask == 0.08
+
+
 class TestOrderParsing:
     """Test order response parsing."""
 

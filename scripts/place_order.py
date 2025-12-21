@@ -462,13 +462,18 @@ class OrderWizard:
                 # Market order using place_market_order
                 print(f"\n  Placing MARKET {self.side.value} order...")
                 if self.value:
-                    print(f"    Value: ${self.value:.2f}")
+                    print(f"    Spending: ${self.value:.2f}")
                     order = await client.place_market_order(
                         side=self.side,
                         value=self.value,
                     )
                 else:
-                    print(f"    Size: {self.size} shares")
+                    if self.side == Side.BUY:
+                        # BUY by size: will be converted to value
+                        est_cost = self.size * (ob.best_ask or 0)
+                        print(f"    Buying: {self.size} shares @ ~{ob.best_ask:.4f} = ~${est_cost:.2f}")
+                    else:
+                        print(f"    Selling: {self.size} shares")
                     order = await client.place_market_order(
                         side=self.side,
                         size=self.size,
