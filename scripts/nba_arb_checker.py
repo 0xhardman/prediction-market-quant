@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import os
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from dotenv import load_dotenv
 
 # 添加 src 到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.clients import PolymarketClient, PredictFunClient
+from src.models import Side, Order
+from src.exceptions import InsufficientBalanceError, OrderRejectedError
 from src.lookup import MarketInfo, lookup_pm_market, lookup_pf_market
 
 # 加载 .env 文件
@@ -28,6 +33,152 @@ REFRESH_INTERVAL = 5  # 刷新间隔（秒）
 PROFIT_THRESHOLD = 0.01  # 利润阈值（1%）
 PM_FEE = 0.0  # Polymarket 费率
 PF_FEE = 0.02  # Predict.fun 费率（2%）
+
+# 数据库路径
+DB_PATH = Path(__file__).parent.parent / "data" / "trades.db"
+
+
+def init_db():
+    """初始化数据库"""
+    DB_PATH.parent.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            -- 市场信息
+            pm_token TEXT NOT NULL,
+            pf_market INTEGER NOT NULL,
+            strategy TEXT,
+
+            -- 价格信息
+            pm_side TEXT,
+            pf_side TEXT,
+            pm_price REAL,
+            pf_price REAL,
+            total_cost REAL,
+            profit_pct REAL,
+
+            -- 下单信息
+            trade_amount REAL,
+            pm_order_id TEXT,
+            pf_order_id TEXT,
+
+            -- 状态
+            success BOOLEAN,
+            error TEXT,
+
+            -- 成交信息
+            pm_filled_price REAL,
+            pf_filled_price REAL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def record_trade(
+    pm_token: str,
+    pf_market: int,
+    arb_result: "ArbResult",
+    trade_amount: float,
+    pm_order: "Order | None",
+    pf_order: "Order | None",
+    success: bool,
+    error: str | None = None,
+):
+    """记录交易到数据库"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('''
+            INSERT INTO trades (
+                pm_token, pf_market, strategy,
+                pm_side, pf_side, pm_price, pf_price, total_cost, profit_pct,
+                trade_amount, pm_order_id, pf_order_id,
+                success, error, pm_filled_price, pf_filled_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            pm_token,
+            pf_market,
+            arb_result.strategy,
+            arb_result.pm_side,
+            arb_result.pf_side,
+            arb_result.pm_price,
+            arb_result.pf_price,
+            arb_result.total_cost,
+            arb_result.profit_pct,
+            trade_amount,
+            pm_order.id if pm_order else None,
+            pf_order.id if pf_order else None,
+            success,
+            error,
+            pm_order.price if pm_order else None,
+            pf_order.price if pf_order else None,
+        ))
+        conn.commit()
+        conn.close()
+        print(f"  [DB] 交易已记录")
+    except Exception as e:
+        print(f"  [DB] 记录失败: {e}")
+
+
+def show_stats():
+    """显示交易统计"""
+    if not DB_PATH.exists():
+        print("暂无交易记录")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # 总体统计
+    cursor.execute("SELECT COUNT(*) FROM trades")
+    total = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE success = 1")
+    success = cursor.fetchone()[0]
+
+    cursor.execute("SELECT SUM(trade_amount) FROM trades WHERE success = 1")
+    total_amount = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT SUM(trade_amount * profit_pct / 100) FROM trades WHERE success = 1")
+    total_profit = cursor.fetchone()[0] or 0
+
+    print("=" * 50)
+    print("                 交易统计")
+    print("=" * 50)
+    print(f"总交易次数: {total}")
+    print(f"成功次数: {success}")
+    print(f"失败次数: {total - success}")
+    print(f"成功率: {success / total * 100:.1f}%" if total > 0 else "成功率: N/A")
+    print()
+    print(f"总投入金额: ${total_amount:.2f}")
+    print(f"预期总收益: ${total_profit:.2f}")
+    print()
+
+    # 最近交易
+    cursor.execute("""
+        SELECT created_at, strategy, trade_amount, profit_pct, success, error
+        FROM trades
+        ORDER BY created_at DESC
+        LIMIT 10
+    """)
+    rows = cursor.fetchall()
+
+    if rows:
+        print("【最近 10 笔交易】")
+        print("-" * 50)
+        for row in rows:
+            created_at, strategy, amount, profit, success, error = row
+            status = "✓" if success else "✗"
+            print(f"{status} {created_at} | {strategy} | ${amount:.0f} | {profit:.2f}%")
+            if error:
+                print(f"    └─ {error[:50]}...")
+
+    print("=" * 50)
+    conn.close()
+
 
 # API 端点
 PM_CLOB_HOST = "https://clob.polymarket.com"
@@ -115,6 +266,53 @@ def parse_pm_input(input_str: str) -> tuple[str, str, str]:
             match = re.search(r'polymarket\.com/sports/[^/]+/games/[^/]+/\d+/([^?/\\]+)', input_str)
             if match:
                 slug = match.group(1).rstrip("\\")
+
+        # 格式3: /event/{slug} (事件级别 URL，单个 slug)
+        if not slug:
+            match = re.search(r'polymarket\.com/event/([^?/\\]+)$', input_str)
+            if match:
+                event_slug = match.group(1).rstrip("\\")
+                # 尝试用事件 slug 查询 gamma API (查询所有相关市场)
+                try:
+                    import json as json_module
+                    resp = httpx.get(
+                        "https://gamma-api.polymarket.com/events",
+                        params={"slug": event_slug},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        events = resp.json()
+                        if events and len(events) > 0:
+                            event = events[0]
+                            markets = event.get("markets", [])
+                            if markets:
+                                # 收集所有 token
+                                all_tokens = []
+                                condition_id = ""
+                                for m in markets:
+                                    cid = m.get("conditionId", "")
+                                    if cid and not condition_id:
+                                        condition_id = cid
+                                    # clobTokenIds 和 outcomes 可能是 JSON 字符串
+                                    clob_tokens_raw = m.get("clobTokenIds", [])
+                                    outcomes_raw = m.get("outcomes", [])
+                                    if isinstance(clob_tokens_raw, str):
+                                        clob_tokens = json_module.loads(clob_tokens_raw)
+                                    else:
+                                        clob_tokens = clob_tokens_raw
+                                    if isinstance(outcomes_raw, str):
+                                        outcomes = json_module.loads(outcomes_raw)
+                                    else:
+                                        outcomes = outcomes_raw
+                                    for i, tid in enumerate(clob_tokens):
+                                        outcome = outcomes[i] if i < len(outcomes) else f"Outcome{i}"
+                                        all_tokens.append((tid, outcome))
+                                if all_tokens:
+                                    first_token = all_tokens[0][0] if all_tokens else ""
+                                    second_token = all_tokens[1][0] if len(all_tokens) > 1 else ""
+                                    return condition_id, first_token, second_token
+                except Exception as e:
+                    print(f"[警告] 事件查询失败: {e}")
 
         if slug:
             data = pm_lookup_by_slug(slug)
@@ -721,10 +919,429 @@ def send_telegram_alert(arb_result: ArbResult, pm_url: str = "", pf_url: str = "
         print(f"[Telegram] 发送失败: {e}")
 
 
+def send_telegram_trade_result(
+    success: bool,
+    arb_result: ArbResult,
+    pm_order: Order | None,
+    pf_order: Order | None,
+    error: str | None = None,
+):
+    """发送交易执行结果通知"""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+
+    if success:
+        message = f"""✅ *套利交易成功!*
+
+*策略*: {arb_result.strategy}
+*PM {arb_result.pm_side}*: {pm_order.price:.4f} x {pm_order.size:.2f}
+*PF {arb_result.pf_side}*: {pf_order.price:.4f} x {pf_order.size:.2f}
+
+💵 *总投入*: ${arb_result.best_amount:.0f}
+🎯 *预期收益*: ${arb_result.expected_profit:.2f}
+"""
+    else:
+        message = f"""❌ *套利交易失败!*
+
+*策略*: {arb_result.strategy}
+*错误*: {error or '未知错误'}
+
+*PM订单*: {'成功' if pm_order else '失败'}
+*PF订单*: {'成功' if pf_order else '失败'}
+"""
+
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TG_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown",
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[Telegram] 发送交易结果失败: {e}")
+
+
+# ============ 交易执行 ============
+
+async def execute_arb_trade(
+    arb_result: ArbResult,
+    pm_token: str,
+    pf_market: int,
+    trade_amount: float | None = None,
+) -> dict:
+    """执行套利交易
+
+    Args:
+        arb_result: 套利分析结果
+        pm_token: Polymarket token_id
+        pf_market: Predict.fun market_id
+        trade_amount: 指定下单金额，不指定则使用 best_amount
+
+    Returns:
+        {
+            "success": bool,
+            "pm_order": Order | None,
+            "pf_order": Order | None,
+            "error": str | None,
+        }
+    """
+    pm_order = None
+    pf_order = None
+    pm_client = None
+    pf_client = None
+
+    try:
+        # 计算每边下单金额（各投一半）
+        total_amount = trade_amount if trade_amount else arb_result.best_amount
+        amount_per_side = total_amount / 2
+
+        print(f"\n[交易] 开始执行套利交易...")
+        print(f"  策略: {arb_result.strategy}")
+        print(f"  每边金额: ${amount_per_side:.2f}")
+
+        # 初始化 Client
+        pm_client = PolymarketClient(token_id=pm_token)
+        pf_client = PredictFunClient(market_id=pf_market)
+
+        # 连接
+        await asyncio.gather(
+            pm_client.connect(),
+            pf_client.connect(),
+        )
+
+        print(f"  PM Client 已连接")
+        print(f"  PF Client 已连接")
+
+        # 并行下单（市价单）
+        print(f"  正在下单...")
+
+        async def place_pm_order():
+            return await pm_client.place_market_order(
+                side=Side.BUY,
+                value=amount_per_side,
+            )
+
+        async def place_pf_order():
+            return await pf_client.place_market_order(
+                side=Side.BUY,
+                value=amount_per_side,
+            )
+
+        # 尝试并行下单
+        results = await asyncio.gather(
+            place_pm_order(),
+            place_pf_order(),
+            return_exceptions=True,
+        )
+
+        pm_result, pf_result = results
+
+        # 检查结果
+        pm_success = isinstance(pm_result, Order)
+        pf_success = isinstance(pf_result, Order)
+
+        if pm_success:
+            pm_order = pm_result
+            print(f"  ✓ PM 订单成功: {pm_order.id[:20]}... @ {pm_order.price:.4f}")
+        else:
+            print(f"  ✗ PM 订单失败: {pm_result}")
+
+        if pf_success:
+            pf_order = pf_result
+            print(f"  ✓ PF 订单成功: {pf_order.id[:20]}... @ {pf_order.price:.4f}")
+        else:
+            print(f"  ✗ PF 订单失败: {pf_result}")
+
+        # 两边都成功
+        if pm_success and pf_success:
+            print(f"  🎉 套利交易完成!")
+            send_telegram_trade_result(True, arb_result, pm_order, pf_order)
+            record_trade(pm_token, pf_market, arb_result, total_amount, pm_order, pf_order, True)
+            return {
+                "success": True,
+                "pm_order": pm_order,
+                "pf_order": pf_order,
+                "error": None,
+            }
+
+        # 一边成功一边失败 - 卖掉成功的那边
+        error_msg = ""
+        if pm_success and not pf_success:
+            error_msg = f"PF下单失败: {pf_result}"
+            print(f"  [回滚] PF 下单失败，尝试卖出 PM 持仓...")
+            try:
+                # 获取持仓数量
+                position = await pm_client.get_position()
+                if position and position > 0:
+                    sell_order = await pm_client.place_market_order(
+                        side=Side.SELL,
+                        size=position,
+                    )
+                    print(f"  [回滚] PM 卖出成功: {sell_order.size:.2f} @ {sell_order.price:.4f}")
+            except Exception as e:
+                print(f"  [回滚] PM 卖出失败: {e}")
+
+        elif pf_success and not pm_success:
+            error_msg = f"PM下单失败: {pm_result}"
+            print(f"  [回滚] PM 下单失败，尝试卖出 PF 持仓...")
+            try:
+                position = await pf_client.get_position()
+                if position and position > 0:
+                    sell_order = await pf_client.place_market_order(
+                        side=Side.SELL,
+                        size=position,
+                    )
+                    print(f"  [回滚] PF 卖出成功: {sell_order.size:.2f} @ {sell_order.price:.4f}")
+            except Exception as e:
+                print(f"  [回滚] PF 卖出失败: {e}")
+
+        else:
+            error_msg = f"两边都失败 - PM: {pm_result}, PF: {pf_result}"
+
+        send_telegram_trade_result(False, arb_result, pm_order, pf_order, error_msg)
+        record_trade(pm_token, pf_market, arb_result, total_amount, pm_order, pf_order, False, error_msg)
+        return {
+            "success": False,
+            "pm_order": pm_order,
+            "pf_order": pf_order,
+            "error": error_msg,
+        }
+
+    except Exception as e:
+        error_msg = f"交易执行异常: {e}"
+        print(f"  [错误] {error_msg}")
+        send_telegram_trade_result(False, arb_result, pm_order, pf_order, error_msg)
+        record_trade(pm_token, pf_market, arb_result, trade_amount or 0, pm_order, pf_order, False, error_msg)
+        return {
+            "success": False,
+            "pm_order": pm_order,
+            "pf_order": pf_order,
+            "error": error_msg,
+        }
+    finally:
+        # 关闭 Client
+        if pm_client:
+            try:
+                await pm_client.close()
+            except Exception:
+                pass
+        if pf_client:
+            try:
+                await pf_client.close()
+            except Exception:
+                pass
+
+
+async def execute_arb_trade_teams(
+    arb_result: ArbResult,
+    pm_tokens: list[tuple[str, str]],  # [(token_id, outcome), ...]
+    pf_markets: list[tuple[int, str]],  # [(market_id, outcome), ...]
+    trade_amount: float | None = None,
+) -> dict:
+    """执行 Team vs Team 市场的套利交易
+
+    根据 arb_result.pm_side 和 pf_side 确定买哪个 token/market
+
+    Args:
+        trade_amount: 指定下单金额，不指定则使用 best_amount
+    """
+    pm_order = None
+    pf_order = None
+    pm_client = None
+    pf_client = None
+
+    try:
+        # 找到要买的 token/market
+        pm_token = None
+        pf_market = None
+
+        # 使用 team alias 匹配（因为 PM 用球队名，PF 用城市名）
+        def normalize_team(name: str) -> str:
+            """将球队名/城市名归一化"""
+            team_aliases = {
+                "Bulls": "Chicago", "Hawks": "Atlanta", "Celtics": "Boston",
+                "Nets": "Brooklyn", "Hornets": "Charlotte", "Cavaliers": "Cleveland",
+                "Pistons": "Detroit", "Pacers": "Indiana", "Heat": "Miami",
+                "Bucks": "Milwaukee", "Knicks": "New York", "Magic": "Orlando",
+                "76ers": "Philadelphia", "Raptors": "Toronto", "Wizards": "Washington",
+                "Mavericks": "Dallas", "Nuggets": "Denver", "Warriors": "Golden State",
+                "Rockets": "Houston", "Clippers": "Los Angeles Clippers",
+                "Lakers": "Los Angeles Lakers", "Grizzlies": "Memphis",
+                "Timberwolves": "Minnesota", "Pelicans": "New Orleans",
+                "Thunder": "Oklahoma City", "Suns": "Phoenix", "Trail Blazers": "Portland",
+                "Kings": "Sacramento", "Spurs": "San Antonio", "Jazz": "Utah",
+            }
+            # 如果是球队名，返回城市名
+            if name in team_aliases:
+                return team_aliases[name].lower()
+            # 否则返回原名（小写）
+            return name.lower()
+
+        pm_side_normalized = normalize_team(arb_result.pm_side)
+        pf_side_normalized = normalize_team(arb_result.pf_side)
+
+        for token_id, outcome in pm_tokens:
+            if normalize_team(outcome) == pm_side_normalized or outcome == arb_result.pm_side:
+                pm_token = token_id
+                break
+
+        for market_id, outcome in pf_markets:
+            if normalize_team(outcome) == pf_side_normalized or outcome == arb_result.pf_side:
+                pf_market = market_id
+                break
+
+        if not pm_token or not pf_market:
+            error_msg = f"无法匹配 token/market: pm_side={arb_result.pm_side}, pf_side={arb_result.pf_side}"
+            print(f"  [错误] 无法匹配 token/market:")
+            print(f"    pm_side={arb_result.pm_side} -> {pm_side_normalized}, pm_token={pm_token}")
+            print(f"    pf_side={arb_result.pf_side} -> {pf_side_normalized}, pf_market={pf_market}")
+            print(f"    pm_tokens={[(t[:10]+'...', o) for t, o in pm_tokens]}")
+            print(f"    pf_markets={pf_markets}")
+            # 记录失败的匹配尝试
+            send_telegram_trade_result(False, arb_result, None, None, error_msg)
+            record_trade(
+                pm_tokens[0][0] if pm_tokens else "",
+                pf_markets[0][0] if pf_markets else 0,
+                arb_result, trade_amount or 0, None, None, False, error_msg
+            )
+            return {
+                "success": False,
+                "pm_order": None,
+                "pf_order": None,
+                "error": error_msg,
+            }
+
+        total_amount = trade_amount if trade_amount else arb_result.best_amount
+        amount_per_side = total_amount / 2
+
+        print(f"\n[交易] 开始执行 Team vs Team 套利交易...")
+        print(f"  策略: {arb_result.strategy}")
+        print(f"  PM 买 {arb_result.pm_side}: {pm_token[:20]}...")
+        print(f"  PF 买 {arb_result.pf_side}: Market {pf_market}")
+        print(f"  每边金额: ${amount_per_side:.2f}")
+
+        # 初始化 Client
+        pm_client = PolymarketClient(token_id=pm_token)
+        pf_client = PredictFunClient(market_id=pf_market)
+
+        await asyncio.gather(
+            pm_client.connect(),
+            pf_client.connect(),
+        )
+
+        print(f"  PM Client 已连接")
+        print(f"  PF Client 已连接")
+
+        # 并行下单
+        print(f"  正在下单...")
+
+        results = await asyncio.gather(
+            pm_client.place_market_order(side=Side.BUY, value=amount_per_side),
+            pf_client.place_market_order(side=Side.BUY, value=amount_per_side),
+            return_exceptions=True,
+        )
+
+        pm_result, pf_result = results
+        pm_success = isinstance(pm_result, Order)
+        pf_success = isinstance(pf_result, Order)
+
+        if pm_success:
+            pm_order = pm_result
+            print(f"  ✓ PM 订单成功: {pm_order.id[:20]}... @ {pm_order.price:.4f}")
+        else:
+            print(f"  ✗ PM 订单失败: {pm_result}")
+
+        if pf_success:
+            pf_order = pf_result
+            print(f"  ✓ PF 订单成功: {pf_order.id[:20]}... @ {pf_order.price:.4f}")
+        else:
+            print(f"  ✗ PF 订单失败: {pf_result}")
+
+        if pm_success and pf_success:
+            print(f"  🎉 套利交易完成!")
+            send_telegram_trade_result(True, arb_result, pm_order, pf_order)
+            record_trade(pm_token, pf_market, arb_result, total_amount, pm_order, pf_order, True)
+            return {
+                "success": True,
+                "pm_order": pm_order,
+                "pf_order": pf_order,
+                "error": None,
+            }
+
+        # 回滚逻辑
+        error_msg = ""
+        if pm_success and not pf_success:
+            error_msg = f"PF下单失败: {pf_result}"
+            print(f"  [回滚] PF 下单失败，尝试卖出 PM 持仓...")
+            try:
+                position = await pm_client.get_position()
+                if position and position > 0:
+                    sell_order = await pm_client.place_market_order(side=Side.SELL, size=position)
+                    print(f"  [回滚] PM 卖出成功: {sell_order.size:.2f} @ {sell_order.price:.4f}")
+            except Exception as e:
+                print(f"  [回滚] PM 卖出失败: {e}")
+
+        elif pf_success and not pm_success:
+            error_msg = f"PM下单失败: {pm_result}"
+            print(f"  [回滚] PM 下单失败，尝试卖出 PF 持仓...")
+            try:
+                position = await pf_client.get_position()
+                if position and position > 0:
+                    sell_order = await pf_client.place_market_order(side=Side.SELL, size=position)
+                    print(f"  [回滚] PF 卖出成功: {sell_order.size:.2f} @ {sell_order.price:.4f}")
+            except Exception as e:
+                print(f"  [回滚] PF 卖出失败: {e}")
+        else:
+            error_msg = f"两边都失败 - PM: {pm_result}, PF: {pf_result}"
+
+        send_telegram_trade_result(False, arb_result, pm_order, pf_order, error_msg)
+        record_trade(pm_token, pf_market, arb_result, total_amount, pm_order, pf_order, False, error_msg)
+        return {
+            "success": False,
+            "pm_order": pm_order,
+            "pf_order": pf_order,
+            "error": error_msg,
+        }
+
+    except Exception as e:
+        error_msg = f"交易执行异常: {e}"
+        print(f"  [错误] {error_msg}")
+        send_telegram_trade_result(False, arb_result, pm_order, pf_order, error_msg)
+        record_trade(pm_token, pf_market, arb_result, trade_amount or 0, pm_order, pf_order, False, error_msg)
+        return {
+            "success": False,
+            "pm_order": pm_order,
+            "pf_order": pf_order,
+            "error": error_msg,
+        }
+    finally:
+        if pm_client:
+            try:
+                await pm_client.close()
+            except Exception:
+                pass
+        if pf_client:
+            try:
+                await pf_client.close()
+            except Exception:
+                pass
+
+
 # ============ 主循环 ============
 
-async def monitor_loop(pm_token: str, pf_market: int, pf_api_key: str = None):
-    """持续监控循环"""
+async def monitor_loop(pm_token: str, pf_market: int, pf_api_key: str = None, auto_trade: bool = False, trade_amount: float = None):
+    """持续监控循环
+
+    Args:
+        pm_token: Polymarket token_id
+        pf_market: Predict.fun market_id
+        pf_api_key: Predict.fun API key
+        auto_trade: 是否启用自动交易
+        trade_amount: 指定下单金额，不指定则使用最优金额
+    """
     async with httpx.AsyncClient(timeout=30) as http:
         print(f"开始监控套利机会...")
         print(f"  Polymarket: {pm_token[:20]}..." if len(pm_token) > 20 else f"  Polymarket: {pm_token}")
@@ -740,6 +1357,9 @@ async def monitor_loop(pm_token: str, pf_market: int, pf_api_key: str = None):
         if pf_info:
             print(f"  PF: {pf_info.question[:50]}..." if len(pf_info.question) > 50 else f"  PF: {pf_info.question}")
         print(f"  利润阈值: {PROFIT_THRESHOLD*100:.1f}%")
+        print(f"  自动交易: {'启用' if auto_trade else '禁用'}")
+        if auto_trade:
+            print(f"  下单金额: ${trade_amount:.2f}" if trade_amount else "  下单金额: 使用最优金额")
         print()
         print("按 Ctrl+C 停止监控")
 
@@ -765,6 +1385,16 @@ async def monitor_loop(pm_token: str, pf_market: int, pf_api_key: str = None):
                         play_alert()
                         send_telegram_alert(arb_result)
                         last_alert = time()
+
+                        # 自动交易
+                        if auto_trade:
+                            trade_result = await execute_arb_trade(
+                                arb_result, pm_token, pf_market, trade_amount
+                            )
+                            if trade_result["success"]:
+                                print(f"  ✅ 交易成功执行")
+                            else:
+                                print(f"  ❌ 交易失败: {trade_result.get('error', '未知错误')}")
 
             except httpx.HTTPError as e:
                 print(f"[错误] HTTP请求失败: {e}")
@@ -841,8 +1471,18 @@ async def monitor_loop_teams(
     pm_tokens: list[tuple[str, str]],
     pf_markets: list[tuple[int, str]],
     pf_api_key: str = None,
+    auto_trade: bool = False,
+    trade_amount: float = None,
 ):
-    """持续监控 - Team vs Team 市场"""
+    """持续监控 - Team vs Team 市场
+
+    Args:
+        pm_tokens: Polymarket tokens [(token_id, outcome), ...]
+        pf_markets: Predict.fun markets [(market_id, outcome), ...]
+        pf_api_key: Predict.fun API key
+        auto_trade: 是否启用自动交易
+        trade_amount: 指定下单金额，不指定则使用最优金额
+    """
     if len(pm_tokens) < 2 or len(pf_markets) < 2:
         print("[错误] Team vs Team 市场需要至少两个 outcome")
         return
@@ -853,6 +1493,9 @@ async def monitor_loop_teams(
         print(f"  PF: {pf_markets[0][1]} (ID {pf_markets[0][0]}) vs {pf_markets[1][1]} (ID {pf_markets[1][0]})")
         print(f"  刷新间隔: {REFRESH_INTERVAL}秒")
         print(f"  利润阈值: {PROFIT_THRESHOLD*100:.1f}%")
+        print(f"  自动交易: {'启用' if auto_trade else '禁用'}")
+        if auto_trade:
+            print(f"  下单金额: ${trade_amount:.2f}" if trade_amount else "  下单金额: 使用最优金额")
         print()
         print("按 Ctrl+C 停止监控")
 
@@ -893,6 +1536,16 @@ async def monitor_loop_teams(
                         play_alert()
                         send_telegram_alert(arb_result)
                         last_alert = time()
+
+                        # 自动交易
+                        if auto_trade:
+                            trade_result = await execute_arb_trade_teams(
+                                arb_result, pm_tokens, pf_markets, trade_amount
+                            )
+                            if trade_result["success"]:
+                                print(f"  ✅ 交易成功执行")
+                            else:
+                                print(f"  ❌ 交易失败: {trade_result.get('error', '未知错误')}")
 
             except httpx.HTTPError as e:
                 print(f"[错误] HTTP请求失败: {e}")
@@ -1011,17 +1664,40 @@ def match_outcomes(
 
     Returns: {pm_outcome: pf_outcome}
     """
-    # 常见的球队名称映射
+    # 常见的球队名称映射 (NBA球队名 -> 城市/缩写)
     team_aliases = {
-        "Bucks": ["Milwaukee", "MIL"],
-        "Timberwolves": ["Minnesota", "MIN"],
-        "Lakers": ["Los Angeles Lakers", "LA Lakers", "LAL"],
-        "Warriors": ["Golden State", "GSW"],
+        # 东部联盟
+        "Bulls": ["Chicago", "CHI"],
+        "Hawks": ["Atlanta", "ATL"],
         "Celtics": ["Boston", "BOS"],
-        "Heat": ["Miami", "MIA"],
         "Nets": ["Brooklyn", "BKN"],
+        "Hornets": ["Charlotte", "CHA"],
+        "Cavaliers": ["Cleveland", "CLE"],
+        "Pistons": ["Detroit", "DET"],
+        "Pacers": ["Indiana", "IND"],
+        "Heat": ["Miami", "MIA"],
+        "Bucks": ["Milwaukee", "MIL"],
         "Knicks": ["New York", "NYK"],
-        # 添加更多映射...
+        "Magic": ["Orlando", "ORL"],
+        "76ers": ["Philadelphia", "PHI", "Sixers"],
+        "Raptors": ["Toronto", "TOR"],
+        "Wizards": ["Washington", "WAS"],
+        # 西部联盟
+        "Mavericks": ["Dallas", "DAL"],
+        "Nuggets": ["Denver", "DEN"],
+        "Warriors": ["Golden State", "GSW"],
+        "Rockets": ["Houston", "HOU"],
+        "Clippers": ["Los Angeles Clippers", "LA Clippers", "LAC"],
+        "Lakers": ["Los Angeles Lakers", "LA Lakers", "LAL"],
+        "Grizzlies": ["Memphis", "MEM"],
+        "Timberwolves": ["Minnesota", "MIN"],
+        "Pelicans": ["New Orleans", "NOP"],
+        "Thunder": ["Oklahoma City", "OKC"],
+        "Suns": ["Phoenix", "PHX"],
+        "Trail Blazers": ["Portland", "POR", "Blazers"],
+        "Kings": ["Sacramento", "SAC"],
+        "Spurs": ["San Antonio", "SAS"],
+        "Jazz": ["Utah", "UTA"],
     }
 
     # 构建反向映射
@@ -1070,15 +1746,50 @@ def main():
 
   # 单次检查
   uv run python scripts/arb_checker.py 0x1dc687... 538 --once
+
+  # 启用自动交易
+  uv run python scripts/arb_checker.py 0x1dc687... 538 --auto-trade
+
+  # 查看交易统计
+  uv run python scripts/arb_checker.py --stats
 """,
     )
-    parser.add_argument("pm_market", help="Polymarket condition_id (0x...) 或 token_id 或 URL")
-    parser.add_argument("pf_market", help="Predict.fun market_id 或 URL")
+    parser.add_argument("pm_market", nargs="?", help="Polymarket condition_id (0x...) 或 token_id 或 URL")
+    parser.add_argument("pf_market", nargs="?", help="Predict.fun market_id 或 URL")
     parser.add_argument("--once", action="store_true", help="只检查一次，不持续监控")
     parser.add_argument("--interval", type=int, default=5, help="刷新间隔（秒）")
     parser.add_argument("--threshold", type=float, default=1.0, help="利润阈值（%%）")
+    parser.add_argument("--auto-trade", action="store_true", help="启用自动交易（发现机会时自动下单）")
+    parser.add_argument("--amount", type=float, default=None, help="指定下单金额（美元），不指定则使用最优金额")
+    parser.add_argument("--stats", action="store_true", help="显示交易统计")
 
     args = parser.parse_args()
+
+    # 初始化数据库
+    init_db()
+
+    # 如果是统计命令
+    if args.stats:
+        show_stats()
+        return
+
+    # 启动日志
+    print("=" * 60)
+    print(f"🚀 套利监控启动")
+    print(f"   时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   PM输入: {args.pm_market}")
+    print(f"   PF输入: {args.pf_market}")
+    print(f"   自动交易: {'启用' if args.auto_trade else '禁用'}")
+    if args.auto_trade:
+        print(f"   下单金额: ${args.amount:.2f}" if args.amount else "   下单金额: 使用最优金额")
+    print(f"   刷新间隔: {args.interval}秒")
+    print(f"   利润阈值: {args.threshold}%")
+    print("=" * 60)
+    print()
+
+    # 检查必需参数
+    if not args.pm_market or not args.pf_market:
+        parser.error("需要提供 pm_market 和 pf_market 参数")
 
     # 更新全局配置
     REFRESH_INTERVAL = args.interval
@@ -1192,6 +1903,8 @@ def main():
                             pm_tokens_with_outcomes[:2],
                             pf_markets_ordered[:2],
                             pf_api_key,
+                            auto_trade=args.auto_trade,
+                            trade_amount=args.amount,
                         ))
                 except KeyboardInterrupt:
                     print("\n监控已停止")
@@ -1207,7 +1920,7 @@ def main():
         if args.once:
             asyncio.run(single_check(pm_token1, pf_market, pf_api_key))
         else:
-            asyncio.run(monitor_loop(pm_token1, pf_market, pf_api_key))
+            asyncio.run(monitor_loop(pm_token1, pf_market, pf_api_key, auto_trade=args.auto_trade, trade_amount=args.amount))
     except KeyboardInterrupt:
         print("\n监控已停止")
 
