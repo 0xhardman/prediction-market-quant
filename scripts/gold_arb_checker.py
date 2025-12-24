@@ -266,6 +266,35 @@ def calc_fill_price(orders: list[tuple[float, float]], amount: float) -> tuple[f
     return avg_price, total_cost
 
 
+# ============ 辅助函数 ============
+
+def retry_request(func, max_retries=3, delay=2, url_hint=""):
+    """重试 HTTP 请求"""
+    import time
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_error = e
+            error_type = type(e).__name__
+            error_msg = str(e)
+
+            if attempt < max_retries - 1:
+                print(f"  [重试 {attempt + 1}/{max_retries}] {error_type}: {error_msg}")
+                if url_hint:
+                    print(f"  URL: {url_hint}")
+                print(f"  等待 {delay} 秒后重试...")
+                time.sleep(delay)
+            else:
+                print(f"  [失败] 重试 {max_retries} 次后仍失败")
+                print(f"  错误类型: {error_type}")
+                print(f"  错误信息: {error_msg}")
+                if url_hint:
+                    print(f"  请求URL: {url_hint}")
+                raise
+
+
 # ============ 市场解析 ============
 
 def parse_gold_pm_event(event_url: str) -> list[tuple[str, str]]:
@@ -288,13 +317,19 @@ def parse_gold_pm_event(event_url: str) -> list[tuple[str, str]]:
 
     slug = match.group(1).rstrip('\\')
 
-    # 查询 Gamma API
-    resp = httpx.get(
-        f"{PM_GAMMA_HOST}/events",
-        params={"slug": slug},
-        timeout=10
-    )
-    resp.raise_for_status()
+    # 查询 Gamma API（带重试）
+    api_url = f"{PM_GAMMA_HOST}/events?slug={slug}"
+    def _fetch():
+        resp = httpx.get(
+            f"{PM_GAMMA_HOST}/events",
+            params={"slug": slug},
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            timeout=10
+        )
+        resp.raise_for_status()
+        return resp
+
+    resp = retry_request(_fetch, url_hint=api_url)
 
     events = resp.json()
     if not events:
@@ -375,14 +410,19 @@ def parse_pf_market(market_url: str, api_key: str = None) -> int:
 
     slug = match.group(1)
 
-    # 抓取页面
-    resp = httpx.get(
-        f"https://predict.fun/market/{slug}",
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30,
-        follow_redirects=True
-    )
-    resp.raise_for_status()
+    # 抓取页面（带重试）
+    page_url = f"https://predict.fun/market/{slug}"
+    def _fetch():
+        resp = httpx.get(
+            page_url,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            timeout=30,
+            follow_redirects=True
+        )
+        resp.raise_for_status()
+        return resp
+
+    resp = retry_request(_fetch, url_hint=page_url)
 
     # 提取 market ID
     market_ids = re.findall(r'marketId=(\d+)', resp.text)
@@ -1096,23 +1136,66 @@ def main():
     REFRESH_INTERVAL = args.interval
     PROFIT_THRESHOLD = args.threshold / 100
 
+    # 连接测试
+    print("[0/3] 测试网络连接...")
+    try:
+        test_resp = httpx.get("https://www.google.com", timeout=5)
+        print("  ✓ 基础网络连接正常")
+    except Exception as e:
+        print(f"  ✗ 基础网络连接失败: {e}")
+        print("  提示: 请检查网络连接或代理设置")
+    print()
+
     # 解析市场
     try:
-        print("[1/2] 解析 PM 事件...")
+        print("[1/3] 解析 PM 事件...")
         pm_markets = parse_gold_pm_event(args.pm_event)
         print(f"  ✓ 找到 {len(pm_markets)} 个价格区间市场:")
         for token_id, label in pm_markets:
             print(f"    {label:>12}: {token_id[:20]}...")
         print()
 
-        print("[2/2] 解析 PF 市场...")
+        print("[2/3] 解析 PF 市场...")
         pf_api_key = os.environ.get("PREDICT_FUN_API_KEY")
         pf_market_id = parse_pf_market(args.pf_market, pf_api_key)
         print(f"  ✓ PF Market ID: {pf_market_id}")
         print()
 
+        print("[3/3] 测试 API 连接...")
+        # 测试 Polymarket API
+        try:
+            test_pm = httpx.get(
+                f"{PM_GAMMA_HOST}/markets",
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+                timeout=5
+            )
+            if test_pm.status_code == 200:
+                print(f"  ✓ Polymarket API 连接正常")
+            else:
+                print(f"  ⚠ Polymarket API 返回 {test_pm.status_code}")
+        except Exception as e:
+            print(f"  ✗ Polymarket API 连接失败: {type(e).__name__}: {e}")
+
+        # 测试 Predict.fun API
+        try:
+            test_pf = httpx.get(
+                f"{PF_API_HOST}/markets",
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+                timeout=5
+            )
+            if test_pf.status_code == 200:
+                print(f"  ✓ Predict.fun API 连接正常")
+            else:
+                print(f"  ⚠ Predict.fun API 返回 {test_pf.status_code}")
+        except Exception as e:
+            print(f"  ✗ Predict.fun API 连接失败: {type(e).__name__}: {e}")
+        print()
+
     except Exception as e:
         print(f"[错误] 市场解析失败: {e}")
+        import traceback
+        print("\n详细错误信息:")
+        traceback.print_exc()
         return 1
 
     # 执行
