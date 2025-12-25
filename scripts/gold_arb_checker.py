@@ -201,13 +201,41 @@ async def fetch_pm_orderbook(http: httpx.AsyncClient, token_id: str) -> Orderboo
     return Orderbook(bids=bids, asks=asks, timestamp=time())
 
 
-async def fetch_pf_orderbook(http: httpx.AsyncClient, market_id: int, api_key: str = None) -> Orderbook:
-    """获取 Predict.fun orderbook"""
+async def fetch_pf_orderbook(http: httpx.AsyncClient, market_id: int, api_key: str = None, outcome: str = "NO") -> Orderbook:
+    """获取 Predict.fun orderbook
+
+    Args:
+        http: HTTP client
+        market_id: Market ID
+        api_key: API key
+        outcome: "YES" or "NO" (default: "NO")
+    """
     headers = {}
     if api_key:
         headers["X-API-Key"] = api_key
 
-    resp = await http.get(f"{PF_API_HOST}/markets/{market_id}/orderbook", headers=headers)
+    # 先获取市场信息，找到对应 outcome 的 token ID
+    market_resp = await http.get(f"{PF_API_HOST}/markets/{market_id}", headers=headers)
+    market_resp.raise_for_status()
+    market_data = market_resp.json().get("data", {})
+
+    # 找到指定 outcome 的 token ID
+    token_id = None
+    for o in market_data.get("outcomes", []):
+        if o.get("name") == outcome:
+            token_id = o.get("onChainId")
+            break
+
+    if not token_id:
+        raise ValueError(f"No {outcome} outcome found for market {market_id}")
+
+    # 获取该 outcome 的 orderbook
+    params = {"tokenId": token_id}
+    resp = await http.get(
+        f"{PF_API_HOST}/markets/{market_id}/orderbook",
+        headers=headers,
+        params=params
+    )
     resp.raise_for_status()
 
     book = resp.json().get("data", {})
@@ -468,9 +496,8 @@ def analyze_gold_arb_opportunity(
     if len(pm_books) != 7:
         raise ValueError(f"Expected 7 PM orderbooks, got {len(pm_books)}")
 
-    # 提取基础价格
-    pf_yes_bid = pf_book.bids[0][0] if pf_book.bids else 1.0
-    pf_no_price = 1 - pf_yes_bid
+    # 提取基础价格 - 直接使用 NO ask（因为我们要买 NO）
+    pf_no_price = pf_book.asks[0][0] if pf_book.asks else 0.0
 
     pm_yes_prices = []
     for book, _ in pm_books:
@@ -493,9 +520,8 @@ def analyze_gold_arb_opportunity(
         # 计算份额
         shares = amount / total_cost
 
-        # PF 端 - 买 NO 意味着吃 YES bids
-        pf_orders_for_no = [(1 - p, s) for p, s in pf_book.bids]  # 转换为 NO 价格
-        pf_avg, _ = calc_fill_price(pf_orders_for_no, shares)
+        # PF 端 - 买 NO 直接吃 NO asks
+        pf_avg, _ = calc_fill_price(pf_book.asks, shares)
         pf_cost = shares * pf_avg * (1 + PF_FEE) if pf_avg > 0 else pf_no_cost * shares
         pf_slippage = (pf_avg - pf_no_price) / pf_no_price * 100 if pf_no_price > 0 else 0
 
@@ -594,12 +620,10 @@ def print_gold_report(
     print("【Predict.fun - 金价>4400】")
     print(f"  Market ID: {pf_market}")
 
-    pf_yes_bid = pf_book.bids[0][0] if pf_book.bids else None
-    if pf_yes_bid:
-        pf_no_ask = 1 - pf_yes_bid
+    pf_no_ask = pf_book.asks[0][0] if pf_book.asks else None
+    if pf_no_ask:
         pf_no_cost = pf_no_ask * (1 + PF_FEE)
-        print(f"  Yes Bid: {pf_yes_bid:.4f}")
-        print(f"  No Ask:  {pf_no_ask:.4f} (1 - Yes Bid)")
+        print(f"  NO Ask:  {pf_no_ask:.4f}")
         print(f"  含费成本: {pf_no_cost:.4f} ({PF_FEE*100:.0f}%费率)")
     else:
         print("  No orderbook")
@@ -630,24 +654,6 @@ def print_gold_report(
         if arb_result:
             print(f"  利润率: {arb_result.profit_pct:.2f}% (低于阈值 {PROFIT_THRESHOLD*100:.1f}%)")
     print()
-
-    # 深度分析
-    print("【Orderbook深度分析】")
-    print(f"{'金额':>8} | {'PF滑点':>7} | {'PM最差滑点':>10} | {'总成本':>8} | {'利润率':>7} | {'预期收益':>9}")
-    print("-" * 70)
-
-    max_profit_idx = max(
-        range(len(depth_analysis)),
-        key=lambda i: depth_analysis[i].expected_profit
-    ) if depth_analysis else -1
-
-    for i, d in enumerate(depth_analysis):
-        marker = " <- 收益最高" if i == max_profit_idx else ""
-        print(
-            f"${d.amount:>7.0f} | {d.pf_slippage:>6.2f}% | "
-            f"{d.pm_worst_slippage:>9.2f}% | {d.total_cost:>8.4f} | "
-            f"{d.profit_pct:>6.2f}% | ${d.expected_profit:>8.2f}{marker}"
-        )
 
     print("=" * 70)
 
