@@ -2,12 +2,14 @@
 """
 Predict.fun 市场查询工具
 
-支持两种模式：
+支持三种模式：
 1. 交互式浏览 - 按 category 分组选择市场
-2. URL 解析 - 从链接提取 slug，列出该 event 下的市场
+2. URL 解析 - 从链接提取信息，通过 API 或网页获取市场详情
+3. Market ID - 直接通过 market_id 查询
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -137,10 +139,51 @@ class PFLookup:
         return all_markets
 
     async def fetch_market(self, market_id: int) -> dict:
-        """获取单个市场详情"""
+        """获取单个市场详情（通过API）"""
         client = await self._get_client()
-        resp = await client.get(f"/markets/{market_id}")
-        return resp.json().get("data", {})
+        try:
+            resp = await client.get(f"/markets/{market_id}")
+            resp.raise_for_status()
+            return resp.json().get("data", {})
+        except Exception as e:
+            print(f"API 获取市场 {market_id} 失败: {e}")
+            return {}
+
+    async def fetch_market_from_web(self, url: str) -> dict | None:
+        """从网页抓取市场信息（fallback方案）"""
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as web_client:
+                resp = await web_client.get(url)
+                resp.raise_for_status()
+                html = resp.text
+
+                # 方法1: 从HTML中提取JSON数据（Next.js __NEXT_DATA__）
+                match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', html, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        market_data = data.get('props', {}).get('pageProps', {}).get('market', {})
+                        if market_data and market_data.get('id'):
+                            return market_data
+                    except json.JSONDecodeError:
+                        pass
+
+                # 方法2: 从Next.js streaming data中提取（新版Next.js App Router）
+                # 查找 self.__next_f.push 中的市场数据
+                market_id_match = re.search(r'"id["\s:,]+(\d+)', html)
+                if market_id_match:
+                    market_id = int(market_id_match.group(1))
+                    # 尝试提取问题
+                    question_match = re.search(r'"question["\s:,]+"([^"]+gold[^"]+)"', html, re.IGNORECASE)
+                    question = question_match.group(1) if question_match else ""
+
+                    if market_id:
+                        return {"id": market_id, "question": question}
+
+                return None
+        except Exception as e:
+            print(f"从网页抓取失败: {e}")
+            return None
 
     async def fetch_orderbook(self, market_id: int) -> dict:
         """获取订单簿"""
@@ -302,8 +345,8 @@ async def interactive_mode(lookup: PFLookup):
 
 
 async def url_mode(lookup: PFLookup, url: str):
-    """从 URL 解析模式"""
-    # 提取 slug
+    """从 URL 解析模式（支持 API 搜索 + 网页 fallback）"""
+    # 提取 slug 或 market_id
     # URL 格式: https://predict.fun/market/what-price-will-btc-hit-in-2025
     match = re.search(r"predict\.fun/market/([^/?]+)", url)
     if not match:
@@ -314,58 +357,29 @@ async def url_mode(lookup: PFLookup, url: str):
     slug = match.group(1)
     print()
     print(f"从 URL 提取 slug: {slug}")
-    print()
-    print("正在获取市场列表...")
 
+    # 步骤1: 尝试从API市场列表搜索
+    print()
+    print("步骤 1/3: 正在搜索API市场列表...")
     markets = await lookup.fetch_markets()
 
     # 从 slug 提取关键词进行模糊匹配
-    # 例如 "will-gold-close-above-4400-in-2025" -> ["gold", "4400"]
-    stop_words = ["will", "the", "and", "for", "above", "below", "close", "reach", "2024", "2025", "2026"]
+    stop_words = ["will", "the", "and", "for", "above", "below", "close", "reach", "2024", "2025", "2026", "in"]
     keywords = [w for w in slug.lower().split("-") if len(w) > 2 and w not in stop_words]
-
-    print(f"搜索关键词: {keywords}")
+    print(f"   搜索关键词: {keywords}")
 
     # 先尝试精确匹配 categorySlug
-    matching_markets = [
-        m for m in markets
-        if m.get("categorySlug") == slug
-    ]
+    matching_markets = [m for m in markets if m.get("categorySlug") == slug]
 
-    if not matching_markets:
-        # 尝试模糊匹配：任意关键词出现在 title 或 question 中
+    if not matching_markets and keywords:
+        # 尝试模糊匹配：所有关键词都出现在 title 或 question 中
         matching_markets = [
             m for m in markets
-            if any(kw in m.get("title", "").lower() or kw in m.get("question", "").lower() for kw in keywords)
+            if all(kw in m.get("title", "").lower() or kw in m.get("question", "").lower() for kw in keywords)
         ]
 
-    if not matching_markets:
-        print(f"未找到匹配的市场: {slug}")
-        print()
-        print(f"共获取到 {len(markets)} 个活跃市场，但没有包含关键词 {keywords} 的市场")
-        print()
-        print("这个市场可能:")
-        print("  1. 已经结算/关闭")
-        print("  2. 尚未创建")
-        print("  3. 关键词不匹配")
-        print()
-        print("部分可用市场:")
-        for m in markets[:10]:
-            print(f"  [{m.get('id')}] {m.get('question', '')[:60]}...")
-        return
-
-    print()
-    print(f"找到 {len(matching_markets)} 个匹配的市场:")
-    print()
-
-    for m in matching_markets:
-        mid = m.get("id")
-        question = m.get("question", "")[:60]
-        status = m.get("status", "")
-        print(f"  [{mid}] {question}... ({status})")
-
-    if len(matching_markets) == 1:
-        # 只有一个市场，直接显示详情
+    if matching_markets:
+        print(f"   ✓ 在API中找到 {len(matching_markets)} 个匹配的市场")
         market = matching_markets[0]
         market_id = market.get("id")
         print()
@@ -375,28 +389,63 @@ async def url_mode(lookup: PFLookup, url: str):
         lookup.print_market_details(market, bid, ask)
         return
 
+    # 步骤2: API搜索失败，尝试从网页抓取
+    print(f"   ✗ API中未找到匹配市场（共搜索 {len(markets)} 个市场）")
     print()
-    try:
-        market_choice = input("请选择 Market ID (输入数字, q 退出): ").strip()
-    except (EOFError, KeyboardInterrupt):
+    print("步骤 2/3: 尝试从网页抓取市场信息...")
+
+    web_data = await lookup.fetch_market_from_web(url)
+    if web_data and web_data.get("id"):
+        market_id = web_data.get("id")
+        print(f"   ✓ 从网页获取到 Market ID: {market_id}")
+
+        # 步骤3: 使用market_id从API获取完整数据
         print()
-        return
+        print("步骤 3/3: 通过 Market ID 从 API 获取详情...")
+        market = await lookup.fetch_market(market_id)
+        if market:
+            print("   ✓ 成功获取市场详情")
+            bid, ask = await lookup.get_market_price(market_id)
+            lookup.print_market_details(market, bid, ask)
+            return
+        else:
+            # API获取失败，使用网页数据
+            print("   ⚠ API 获取失败，使用网页数据")
+            bid, ask = await lookup.get_market_price(market_id)
+            lookup.print_market_details(web_data, bid, ask)
+            return
 
-    if market_choice.lower() == "q":
-        return
-
-    try:
-        market_id = int(market_choice)
-    except ValueError:
-        print("请输入数字")
-        return
-
-    # 获取详情
+    # 完全失败
+    print("   ✗ 从网页抓取失败")
     print()
-    print("正在获取市场详情...")
+    print(f"❌ 无法找到市场: {slug}")
+    print()
+    print("可能的原因:")
+    print("  1. 市场已被删除")
+    print("  2. URL 格式不正确")
+    print("  3. 网页结构已更改")
+    print()
+    print("提示: 如果您知道 Market ID，可以直接运行:")
+    print(f"  uv run python {sys.argv[0]} <market_id>")
+
+
+async def market_id_mode(lookup: PFLookup, market_id: int):
+    """直接通过 Market ID 查询模式"""
+    print()
+    print(f"正在查询 Market ID: {market_id}")
+    print()
+
     market = await lookup.fetch_market(market_id)
-    bid, ask = await lookup.get_market_price(market_id)
-    lookup.print_market_details(market, bid, ask)
+    if market and market.get("id"):
+        print("✓ 成功获取市场详情")
+        bid, ask = await lookup.get_market_price(market_id)
+        lookup.print_market_details(market, bid, ask)
+    else:
+        print(f"❌ 未找到 Market ID {market_id}")
+        print()
+        print("请检查:")
+        print("  1. Market ID 是否正确")
+        print("  2. 市场是否存在")
 
 
 async def main():
@@ -405,8 +454,25 @@ async def main():
 
     try:
         if len(sys.argv) > 1:
-            url = sys.argv[1]
-            await url_mode(lookup, url)
+            arg = sys.argv[1]
+
+            # 判断是 URL 还是 Market ID
+            if arg.isdigit():
+                # 纯数字，当作 Market ID
+                await market_id_mode(lookup, int(arg))
+            elif "predict.fun" in arg:
+                # URL 模式
+                await url_mode(lookup, arg)
+            else:
+                print("错误: 参数必须是 Market ID (数字) 或 Predict.fun URL")
+                print()
+                print("用法:")
+                print(f"  {sys.argv[0]} <market_id>")
+                print(f"  {sys.argv[0]} <predict.fun_url>")
+                print()
+                print("示例:")
+                print(f"  {sys.argv[0]} 538")
+                print(f"  {sys.argv[0]} https://predict.fun/market/will-btc-reach-100k")
         else:
             await interactive_mode(lookup)
     finally:
