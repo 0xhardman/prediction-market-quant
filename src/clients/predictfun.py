@@ -408,6 +408,8 @@ class PredictFunClient(BaseClient):
         side: Side,
         size: float | None = None,
         value: float | None = None,
+        token_id: str | None = None,
+        is_yes: bool | None = None,
     ) -> Order:
         """Place a market order.
 
@@ -418,12 +420,18 @@ class PredictFunClient(BaseClient):
             side: BUY or SELL
             size: Number of shares (required for SELL, optional for BUY)
             value: USD value to spend (required for BUY if size not provided)
+            token_id: Override token ID (optional, defaults to client's token_id)
+            is_yes: Override YES/NO flag (optional, defaults to client's is_yes)
 
         Returns:
             Order object with execution details
         """
         self._ensure_connected()
         await self._ensure_valid_token()
+
+        # Use overrides or defaults
+        use_token_id = token_id or self.token_id
+        use_is_yes = is_yes if is_yes is not None else self.is_yes
 
         # Validate parameters
         if side == Side.BUY and size is None and value is None:
@@ -432,10 +440,30 @@ class PredictFunClient(BaseClient):
             raise ValueError("SELL market order requires size")
 
         # Get orderbook for price calculation
-        ob = await self.get_orderbook()
+        # For NO tokens, we need the original YES orderbook for SDK calculations
+        if use_is_yes:
+            ob = await self.get_orderbook()
+        else:
+            # Fetch raw YES orderbook directly (bypass NO conversion)
+            resp = await self._http.get(f"/markets/{self.market_id}/orderbook")
+            resp.raise_for_status()
+            book = resp.json().get("data", {})
+            yes_bids = [(float(b[0]), float(b[1])) for b in book.get("bids", [])]
+            yes_asks = [(float(a[0]), float(a[1])) for a in book.get("asks", [])]
+            yes_bids.sort(key=lambda x: x[0], reverse=True)
+            yes_asks.sort(key=lambda x: x[0])
+            ob = Orderbook(bids=yes_bids, asks=yes_asks, timestamp=time())
         sdk_book = self._build_sdk_book(ob)
 
-        sdk_side = SdkSide.BUY if side == Side.BUY else SdkSide.SELL
+        # The actual order side (BUY or SELL the token)
+        order_side = SdkSide.BUY if side == Side.BUY else SdkSide.SELL
+
+        # For SDK amount calculations with NO tokens, we reverse the side
+        # because BUY NO eats YES bids, SELL NO eats YES asks
+        if use_is_yes:
+            calc_side = order_side
+        else:
+            calc_side = SdkSide.SELL if side == Side.BUY else SdkSide.BUY
 
         # Calculate amounts based on input type
         if side == Side.BUY and value is not None:
@@ -443,7 +471,7 @@ class PredictFunClient(BaseClient):
             value_wei = int(value * 1e18)
             logger.info(f"Placing market order: {side.value} ${value:.2f}")
             amounts = self._builder.get_market_order_amounts(
-                MarketHelperValueInput(side=SdkSide.BUY, value_wei=value_wei),
+                MarketHelperValueInput(side=calc_side, value_wei=value_wei),
                 sdk_book,
             )
         else:
@@ -451,7 +479,7 @@ class PredictFunClient(BaseClient):
             size_wei = int(size * 1e18)
             logger.info(f"Placing market order: {side.value} {size} shares")
             amounts = self._builder.get_market_order_amounts(
-                MarketHelperInput(side=sdk_side, quantity_wei=size_wei),
+                MarketHelperInput(side=calc_side, quantity_wei=size_wei),
                 sdk_book,
             )
 
@@ -459,8 +487,8 @@ class PredictFunClient(BaseClient):
         order = self._builder.build_order(
             "MARKET",
             BuildOrderInput(
-                token_id=self.token_id,
-                side=sdk_side,
+                token_id=use_token_id,
+                side=order_side,
                 maker_amount=amounts.maker_amount,
                 taker_amount=amounts.taker_amount,
                 fee_rate_bps=200,  # 2% fee
@@ -516,7 +544,7 @@ class PredictFunClient(BaseClient):
             logger.info(f"Market order placed: hash={returned_hash[:30]}... avg_price={avg_price:.4f}")
             return Order(
                 id=returned_hash,
-                token_id=self.token_id,
+                token_id=use_token_id,
                 side=side,
                 price=avg_price,
                 size=size or (value / avg_price if avg_price > 0 else 0),

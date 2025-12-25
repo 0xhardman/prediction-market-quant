@@ -92,8 +92,10 @@ class PolymarketClient(BaseClient):
                 logger.debug("Derived API credentials")
             self._client.set_api_creds(creds)
 
-            # Initialize HTTP client for orderbook
-            self._http = httpx.AsyncClient(timeout=10)
+            # Initialize HTTP client for orderbook with strict timeout
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, connect=3.0)  # 5s total, 3s connect
+            )
 
             logger.info("Connected to Polymarket successfully")
 

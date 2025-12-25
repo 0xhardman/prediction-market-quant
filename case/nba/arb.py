@@ -47,6 +47,20 @@ PF_FEE_RATE = 1.02  # 2% fee on Predict.fun
 
 logger = get_logger("nba_arb")
 
+# Team name to city mapping (PM uses team names, PF uses city names)
+TEAM_TO_CITY = {
+    "Thunder": "Oklahoma City",
+    "Spurs": "San Antonio",
+    "Rockets": "Houston",
+    "Lakers": "Los Angeles",
+    "Timberwolves": "Minnesota",
+    "Nuggets": "Denver",
+    "Cavaliers": "Cleveland",
+    "Knicks": "New York",
+    "Mavericks": "Dallas",
+    "Warriors": "Golden State",
+}
+
 
 @dataclass
 class GameConfig:
@@ -105,17 +119,23 @@ def load_game_config(game_name: str) -> GameConfig:
             pm_team_a_token = pm["outcomes"].get(team_a_name)
             pm_team_b_token = pm["outcomes"].get(team_b_name)
 
-            # Find PF markets - need to match city names to team names
-            # Thunder -> Oklahoma City, Spurs -> San Antonio, etc.
+            # Find PF markets using team-to-city mapping
+            city_a = TEAM_TO_CITY.get(team_a_name)
+            city_b = TEAM_TO_CITY.get(team_b_name)
+
             pf_team_a = None
             pf_team_b = None
             for city, market in pf["markets"].items():
-                # Check if this city matches team_a or team_b
-                # Use the order in the markets dict
-                if pf_team_a is None:
+                if city == city_a:
                     pf_team_a = (city, market)
-                else:
+                elif city == city_b:
                     pf_team_b = (city, market)
+
+            if not pf_team_a or not pf_team_b:
+                raise ValueError(
+                    f"Could not match PF markets for {team_a_name} ({city_a}) "
+                    f"or {team_b_name} ({city_b})"
+                )
 
             return GameConfig(
                 game_name=game_name,
@@ -207,18 +227,22 @@ async def check_arbitrage(
 ) -> ArbOpportunity | None:
     """Check for arbitrage opportunity across all directions."""
     try:
-        # Fetch all 4 orderbooks concurrently
-        tasks = [
-            clients["pm_team_a"].get_orderbook(),
-            clients["pm_team_b"].get_orderbook(),
-            clients["pf_team_a_yes"].get_orderbook(),
-            clients["pf_team_b_yes"].get_orderbook(),
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Failed to fetch orderbook {i}: {result}")
+        # Fetch orderbooks sequentially to identify slow one
+        results = []
+        names = ["pm_team_a", "pm_team_b", "pf_team_a", "pf_team_b"]
+        for name in names:
+            start = time()
+            try:
+                result = await asyncio.wait_for(
+                    clients[name].get_orderbook(),
+                    timeout=5.0,
+                )
+                results.append(result)
+            except asyncio.TimeoutError:
+                logger.warning(f"{name} orderbook timeout after {time() - start:.2f}s")
+                return None
+            except Exception as e:
+                logger.error(f"{name} orderbook error after {time() - start:.2f}s: {e}")
                 return None
 
         pm_a_book, pm_b_book, pf_a_book, pf_b_book = results
@@ -236,6 +260,20 @@ async def check_arbitrage(
             # Direction 1: PF YES + PM NO
             cost1 = pf_a_yes_ask * PF_FEE_RATE + pm_a_no_ask
             profit1 = 1 - cost1
+
+            # Direction 2: PF NO + PM YES
+            cost2 = pf_a_no_ask * PF_FEE_RATE + pm_a_yes_ask
+            profit2 = 1 - cost2
+
+            # Log only 2 directions (Team B is symmetric)
+            logger.info(
+                f"PF_YES({game_config.team_a})+PM_YES({game_config.team_b}): "
+                f"{pf_a_yes_ask:.2f}*1.02+{pm_a_no_ask:.2f}={cost1:.3f} -> {profit1:+.2%}"
+            )
+            logger.info(
+                f"PF_NO({game_config.team_a})+PM_YES({game_config.team_a}): "
+                f"{pf_a_no_ask:.2f}*1.02+{pm_a_yes_ask:.2f}={cost2:.3f} -> {profit2:+.2%}"
+            )
             if profit1 > best_profit:
                 min_price = min(pf_a_yes_ask, pm_a_no_ask)
                 min_shares = PM_MIN_ORDER_VALUE / min_price if min_price > 0 else float('inf')
@@ -254,9 +292,6 @@ async def check_arbitrage(
                 )
                 best_profit = profit1
 
-            # Direction 2: PF NO + PM YES
-            cost2 = pf_a_no_ask * PF_FEE_RATE + pm_a_yes_ask
-            profit2 = 1 - cost2
             if profit2 > best_profit:
                 min_price = min(pf_a_no_ask, pm_a_yes_ask)
                 min_shares = PM_MIN_ORDER_VALUE / min_price if min_price > 0 else float('inf')
@@ -290,6 +325,11 @@ async def check_arbitrage(
             # Direction 1: PF YES + PM NO
             cost1 = pf_b_yes_ask * PF_FEE_RATE + pm_b_no_ask
             profit1 = 1 - cost1
+
+            # Direction 2: PF NO + PM YES
+            cost2 = pf_b_no_ask * PF_FEE_RATE + pm_b_yes_ask
+            profit2 = 1 - cost2
+
             if profit1 > best_profit:
                 min_price = min(pf_b_yes_ask, pm_b_no_ask)
                 min_shares = PM_MIN_ORDER_VALUE / min_price if min_price > 0 else float('inf')
@@ -308,9 +348,6 @@ async def check_arbitrage(
                 )
                 best_profit = profit1
 
-            # Direction 2: PF NO + PM YES
-            cost2 = pf_b_no_ask * PF_FEE_RATE + pm_b_yes_ask
-            profit2 = 1 - cost2
             if profit2 > best_profit:
                 min_price = min(pf_b_no_ask, pm_b_yes_ask)
                 min_shares = PM_MIN_ORDER_VALUE / min_price if min_price > 0 else float('inf')
@@ -351,21 +388,27 @@ async def execute_arbitrage(
 
     success = True
 
-    # Determine which clients to use
+    # Determine which clients and tokens to use
     is_team_a = opp.team == game_config.team_a
 
     if opp.direction == "pf_yes_pm_no":
         # Buy PF YES + PM opponent YES
-        pf_client = clients["pf_team_a_yes"] if is_team_a else clients["pf_team_b_yes"]
+        pf_client = clients["pf_team_a"] if is_team_a else clients["pf_team_b"]
+        pf_token_id = game_config.pf_team_a_yes_token if is_team_a else game_config.pf_team_b_yes_token
+        pf_is_yes = True
         pm_client = clients["pm_team_b"] if is_team_a else clients["pm_team_a"]
     else:  # pf_no_pm_yes
         # Buy PF NO + PM team YES
-        pf_client = clients["pf_team_a_no"] if is_team_a else clients["pf_team_b_no"]
+        pf_client = clients["pf_team_a"] if is_team_a else clients["pf_team_b"]
+        pf_token_id = game_config.pf_team_a_no_token if is_team_a else game_config.pf_team_b_no_token
+        pf_is_yes = False
         pm_client = clients["pm_team_a"] if is_team_a else clients["pm_team_b"]
 
     # Place PF order
     try:
-        order = await pf_client.place_market_order(Side.BUY, size=shares)
+        order = await pf_client.place_market_order(
+            Side.BUY, size=shares, token_id=pf_token_id, is_yes=pf_is_yes
+        )
         logger.info(f"PF order placed: {order.id[:30]}...")
     except Exception as e:
         logger.error(f"Failed to place PF order: {e}")
@@ -399,32 +442,20 @@ async def monitor_loop(game_config: GameConfig):
     else:
         logger.info("Telegram not configured, notifications disabled")
 
-    # Create clients (6 per game: 4 PF + 2 PM)
+    # Create clients (4 per game: 2 PF + 2 PM)
     clients = {
         "pm_team_a": PolymarketClient(token_id=game_config.pm_team_a_token, config=pm_config),
         "pm_team_b": PolymarketClient(token_id=game_config.pm_team_b_token, config=pm_config),
-        "pf_team_a_yes": PredictFunClient(
+        "pf_team_a": PredictFunClient(
             market_id=game_config.pf_team_a_market_id,
             token_id=game_config.pf_team_a_yes_token,
             is_yes=True,
             config=pf_config,
         ),
-        "pf_team_a_no": PredictFunClient(
-            market_id=game_config.pf_team_a_market_id,
-            token_id=game_config.pf_team_a_no_token,
-            is_yes=False,
-            config=pf_config,
-        ),
-        "pf_team_b_yes": PredictFunClient(
+        "pf_team_b": PredictFunClient(
             market_id=game_config.pf_team_b_market_id,
             token_id=game_config.pf_team_b_yes_token,
             is_yes=True,
-            config=pf_config,
-        ),
-        "pf_team_b_no": PredictFunClient(
-            market_id=game_config.pf_team_b_market_id,
-            token_id=game_config.pf_team_b_no_token,
-            is_yes=False,
             config=pf_config,
         ),
     }
@@ -435,20 +466,18 @@ async def monitor_loop(game_config: GameConfig):
         await clients["pm_team_a"].connect()
         await clients["pm_team_b"].connect()
 
-        logger.info("Connecting to PF (4 clients)...")
-        for name, client in clients.items():
-            if name.startswith("pf_"):
-                await client.connect()
-                logger.debug(f"{name} connected")
+        logger.info("Connecting to PF (2 clients)...")
+        await clients["pf_team_a"].connect()
+        await clients["pf_team_b"].connect()
 
-        logger.info("All clients connected")
+        logger.info("All 4 clients connected")
 
         # Check initial balances
-        pf_balance = await clients["pf_team_a_yes"].get_balance()
+        pf_balance = await clients["pf_team_a"].get_balance()
         pm_balance = await clients["pm_team_a"].get_balance()
         logger.info(f"Balances: PF={pf_balance:.2f} USDT, PM={pm_balance:.2f} USDC")
 
-        logger.info("Starting monitor loop")
+        logger.info("Starting monitor loop, fetching orderbooks...")
 
         # Monitor loop
         while True:
@@ -486,7 +515,7 @@ async def monitor_loop(game_config: GameConfig):
                             expected_profit = shares * opp.profit_rate
 
                             # Check balances
-                            pf_balance = await clients["pf_team_a_yes"].get_balance()
+                            pf_balance = await clients["pf_team_a"].get_balance()
                             pm_balance = await clients["pm_team_a"].get_balance()
 
                             if pf_balance < pf_needed:
