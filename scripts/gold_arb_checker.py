@@ -221,13 +221,22 @@ async def fetch_pf_orderbook(http: httpx.AsyncClient, market_id: int, api_key: s
 
     # 找到指定 outcome 的 token ID
     token_id = None
-    for o in market_data.get("outcomes", []):
-        if o.get("name") == outcome:
+    outcomes = market_data.get("outcomes", [])
+
+    # 尝试匹配 outcome（不区分大小写）
+    for o in outcomes:
+        outcome_name = o.get("name", "")
+        if outcome_name.upper() == outcome.upper():
             token_id = o.get("onChainId")
             break
 
     if not token_id:
-        raise ValueError(f"No {outcome} outcome found for market {market_id}")
+        # 打印可用的 outcomes 帮助调试
+        available = [o.get("name") for o in outcomes]
+        raise ValueError(
+            f"No {outcome} outcome found for market {market_id}. "
+            f"Available outcomes: {available}"
+        )
 
     # 获取该 outcome 的 orderbook
     params = {"tokenId": token_id}
@@ -924,9 +933,31 @@ async def execute_gold_arb_trade(
     pf_client = None
 
     try:
+        # 获取 PF NO token ID
+        print(f"  获取 PF NO token ID...")
+        pf_api_key = os.environ.get("PREDICT_FUN_API_KEY")
+        headers = {"X-API-Key": pf_api_key} if pf_api_key else {}
+
+        async with httpx.AsyncClient() as http:
+            market_resp = await http.get(
+                f"{PF_API_HOST}/markets/{pf_market}",
+                headers=headers
+            )
+            market_resp.raise_for_status()
+            market_data = market_resp.json().get("data", {})
+
+            pf_no_token_id = None
+            for o in market_data.get("outcomes", []):
+                if o.get("name", "").upper() == "NO":
+                    pf_no_token_id = o.get("onChainId")
+                    break
+
+            if not pf_no_token_id:
+                raise ValueError(f"Cannot find NO token for PF market {pf_market}")
+
         # 初始化客户端
         print(f"  初始化客户端...")
-        pf_client = PredictFunClient(market_id=pf_market)
+        pf_client = PredictFunClient(market_id=pf_market, token_id=pf_no_token_id)
         pm_clients = [
             PolymarketClient(token_id=token_id)
             for token_id, _ in pm_tokens
