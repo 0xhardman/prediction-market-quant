@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.clients import PolymarketClient, PredictFunClient
-from src.models import Side, Order
+from src.models import Side, Order, Orderbook
 from src.exceptions import InsufficientBalanceError, OrderRejectedError
 from src.lookup import MarketInfo, lookup_pm_market, lookup_pf_market, pm_get_tokens
 
@@ -50,14 +50,6 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "-5088762482")
 
 
 # ============ 数据结构 ============
-
-@dataclass
-class Orderbook:
-    """Orderbook 数据结构"""
-    bids: list[tuple[float, float]]  # [(price, size), ...] 降序
-    asks: list[tuple[float, float]]  # [(price, size), ...] 升序
-    timestamp: float
-
 
 @dataclass
 class GoldArbResult:
@@ -179,82 +171,6 @@ def record_trade(
         print(f"  [DB] 交易已记录")
     except Exception as e:
         print(f"  [DB] 记录失败: {e}")
-
-
-# ============ Orderbook 获取 ============
-
-async def fetch_pm_orderbook(http: httpx.AsyncClient, token_id: str) -> Orderbook:
-    """获取 Polymarket orderbook"""
-    resp = await http.get(
-        f"{PM_CLOB_HOST}/book",
-        params={"token_id": token_id},
-    )
-    resp.raise_for_status()
-    book = resp.json()
-
-    bids = [(float(b["price"]), float(b["size"])) for b in book.get("bids", [])]
-    asks = [(float(a["price"]), float(a["size"])) for a in book.get("asks", [])]
-
-    bids.sort(key=lambda x: x[0], reverse=True)
-    asks.sort(key=lambda x: x[0])
-
-    return Orderbook(bids=bids, asks=asks, timestamp=time())
-
-
-async def fetch_pf_orderbook(http: httpx.AsyncClient, market_id: int, api_key: str = None, outcome: str = "NO") -> Orderbook:
-    """获取 Predict.fun orderbook
-
-    Args:
-        http: HTTP client
-        market_id: Market ID
-        api_key: API key
-        outcome: "YES" or "NO" (default: "NO")
-    """
-    headers = {}
-    if api_key:
-        headers["X-API-Key"] = api_key
-
-    # 先获取市场信息，找到对应 outcome 的 token ID
-    market_resp = await http.get(f"{PF_API_HOST}/markets/{market_id}", headers=headers)
-    market_resp.raise_for_status()
-    market_data = market_resp.json().get("data", {})
-
-    # 找到指定 outcome 的 token ID
-    token_id = None
-    outcomes = market_data.get("outcomes", [])
-
-    # 尝试匹配 outcome（不区分大小写）
-    for o in outcomes:
-        outcome_name = o.get("name", "")
-        if outcome_name.upper() == outcome.upper():
-            token_id = o.get("onChainId")
-            break
-
-    if not token_id:
-        # 打印可用的 outcomes 帮助调试
-        available = [o.get("name") for o in outcomes]
-        raise ValueError(
-            f"No {outcome} outcome found for market {market_id}. "
-            f"Available outcomes: {available}"
-        )
-
-    # 获取该 outcome 的 orderbook
-    params = {"tokenId": token_id}
-    resp = await http.get(
-        f"{PF_API_HOST}/markets/{market_id}/orderbook",
-        headers=headers,
-        params=params
-    )
-    resp.raise_for_status()
-
-    book = resp.json().get("data", {})
-    bids = [(float(b[0]), float(b[1])) for b in book.get("bids", [])]
-    asks = [(float(a[0]), float(a[1])) for a in book.get("asks", [])]
-
-    bids.sort(key=lambda x: x[0], reverse=True)
-    asks.sort(key=lambda x: x[0])
-
-    return Orderbook(bids=bids, asks=asks, timestamp=time())
 
 
 # ============ 套利计算 ============
@@ -713,6 +629,24 @@ def send_telegram_alert(arb_result: GoldArbResult):
         print(f"[Telegram] 发送失败: {e}")
 
 
+# ============ 辅助函数 ============
+
+async def get_pf_no_token_id(market_id: int, api_key: str = None) -> str:
+    """获取 Predict.fun 市场的 NO token ID"""
+    headers = {"X-API-Key": api_key} if api_key else {}
+
+    async with httpx.AsyncClient() as http:
+        resp = await http.get(f"{PF_API_HOST}/markets/{market_id}", headers=headers)
+        resp.raise_for_status()
+        market_data = resp.json().get("data", {})
+
+        for outcome in market_data.get("outcomes", []):
+            if outcome.get("name", "").upper() == "NO":
+                return outcome.get("onChainId")
+
+        raise ValueError(f"No NO outcome found for market {market_id}")
+
+
 # ============ 主循环 ============
 
 async def single_check_gold(
@@ -721,17 +655,26 @@ async def single_check_gold(
     pf_api_key: str = None,
 ):
     """单次检查"""
-    async with httpx.AsyncClient(timeout=30) as http:
-        # 获取所有 orderbook
-        fetch_tasks = [
-            fetch_pm_orderbook(http, token_id)
-            for token_id, _ in pm_markets
-        ]
-        fetch_tasks.append(
-            fetch_pf_orderbook(http, pf_market, pf_api_key)
+    # 初始化客户端
+    pm_clients = [PolymarketClient(token_id=token_id) for token_id, _ in pm_markets]
+
+    # 获取 PF NO token ID
+    pf_no_token_id = await get_pf_no_token_id(pf_market, pf_api_key)
+    pf_client = PredictFunClient(market_id=pf_market, token_id=pf_no_token_id)
+
+    try:
+        # 并行连接所有客户端
+        await asyncio.gather(
+            *[c.connect() for c in pm_clients],
+            pf_client.connect()
         )
 
-        books = await asyncio.gather(*fetch_tasks)
+        # 并行获取所有 orderbook
+        books = await asyncio.gather(
+            *[c.get_orderbook() for c in pm_clients],
+            pf_client.get_orderbook()
+        )
+
         pm_books = books[:-1]
         pf_book = books[-1]
 
@@ -748,6 +691,13 @@ async def single_check_gold(
             pm_books, pf_book,
             arb_result, depth_analysis
         )
+    finally:
+        # 关闭所有客户端
+        await asyncio.gather(
+            *[c.close() for c in pm_clients],
+            pf_client.close(),
+            return_exceptions=True
+        )
 
 
 # ============ 监控循环 ============
@@ -761,91 +711,104 @@ async def monitor_loop_gold(
     dry_run: bool = False,
 ):
     """持续监控金价套利机会"""
-    async with httpx.AsyncClient(timeout=30) as http:
-        print(f"开始监控金价套利机会...")
-        print(f"  PM: 7个价格区间市场 (>=4400)")
-        print(f"  PF: Market {pf_market}")
-        print(f"  刷新间隔: {REFRESH_INTERVAL}秒")
-        print(f"  利润阈值: {PROFIT_THRESHOLD*100:.1f}%")
-        print(f"  自动交易: {'启用' if auto_trade else '禁用'}")
-        if auto_trade:
-            if trade_amount:
-                print(f"  交易金额: ${trade_amount:.2f}")
-            if dry_run:
-                print(f"  模式: DRY-RUN（模拟）")
-        print()
-        print("按 Ctrl+C 停止监控")
-        print()
+    print(f"开始监控金价套利机会...")
+    print(f"  PM: 7个价格区间市场 (>=4400)")
+    print(f"  PF: Market {pf_market}")
+    print(f"  刷新间隔: {REFRESH_INTERVAL}秒")
+    print(f"  利润阈值: {PROFIT_THRESHOLD*100:.1f}%")
+    print(f"  自动交易: {'启用' if auto_trade else '禁用'}")
+    if auto_trade:
+        if trade_amount:
+            print(f"  交易金额: ${trade_amount:.2f}")
+        if dry_run:
+            print(f"  模式: DRY-RUN（模拟）")
+    print()
+    print("按 Ctrl+C 停止监控")
+    print()
 
-        last_alert = 0
+    last_alert = 0
+    pf_no_token_id = await get_pf_no_token_id(pf_market, pf_api_key)
 
-        while True:
+    while True:
+        try:
+            # 初始化客户端
+            pm_clients = [PolymarketClient(token_id=token_id) for token_id, _ in pm_markets]
+            pf_client = PredictFunClient(market_id=pf_market, token_id=pf_no_token_id)
+
             try:
-                # 获取所有 orderbook
-                fetch_tasks = [
-                    fetch_pm_orderbook(http, token_id)
-                    for token_id, _ in pm_markets
-                ]
-                fetch_tasks.append(
-                    fetch_pf_orderbook(http, pf_market, pf_api_key)
+                # 并行连接和获取 orderbook
+                await asyncio.gather(
+                    *[c.connect() for c in pm_clients],
+                    pf_client.connect()
                 )
 
-                books = await asyncio.gather(*fetch_tasks)
+                books = await asyncio.gather(
+                    *[c.get_orderbook() for c in pm_clients],
+                    pf_client.get_orderbook()
+                )
+
                 pm_books = books[:-1]
                 pf_book = books[-1]
-
-                # 分析
-                arb_result, depth_analysis = analyze_gold_arb_opportunity(
-                    list(zip(pm_books, [label for _, label in pm_markets])),
-                    pf_book,
-                    pm_markets,
+            finally:
+                # 关闭客户端
+                await asyncio.gather(
+                    *[c.close() for c in pm_clients],
+                    pf_client.close(),
+                    return_exceptions=True
                 )
 
-                # 打印报告
-                print_gold_report(
-                    pm_markets, pf_market,
-                    pm_books, pf_book,
-                    arb_result, depth_analysis
-                )
+            # 分析
+            arb_result, depth_analysis = analyze_gold_arb_opportunity(
+                list(zip(pm_books, [label for _, label in pm_markets])),
+                pf_book,
+                pm_markets,
+            )
 
-                # 发现机会
-                if arb_result and arb_result.profit_pct >= PROFIT_THRESHOLD * 100:
-                    current_time = time()
-                    if current_time - last_alert > 60:  # 限制频率：60秒
-                        play_alert()
-                        send_telegram_alert(arb_result)
-                        last_alert = current_time
+            # 打印报告
+            print_gold_report(
+                pm_markets, pf_market,
+                pm_books, pf_book,
+                arb_result, depth_analysis
+            )
 
-                        # 自动交易
-                        if auto_trade:
-                            print("\n[自动交易] 发现套利机会，准备执行...")
-                            result = await execute_gold_arb_trade(
-                                arb_result,
-                                pm_markets,
-                                pf_market,
-                                trade_amount,
-                                dry_run
-                            )
+            # 发现机会
+            if arb_result and arb_result.profit_pct >= PROFIT_THRESHOLD * 100:
+                current_time = time()
+                if current_time - last_alert > 60:  # 限制频率：60秒
+                    play_alert()
+                    send_telegram_alert(arb_result)
+                    last_alert = current_time
 
-                            if result["success"]:
-                                if result.get("dry_run"):
-                                    print("[自动交易] DRY-RUN 模拟成功")
-                                else:
-                                    print("[自动交易] 交易成功！暂停30分钟")
-                                    await asyncio.sleep(1800)  # 冷却30分钟
+                    # 自动交易
+                    if auto_trade:
+                        print("\n[自动交易] 发现套利机会，准备执行...")
+                        result = await execute_gold_arb_trade(
+                            arb_result,
+                            pm_markets,
+                            pf_market,
+                            trade_amount,
+                            dry_run
+                        )
+
+                        if result["success"]:
+                            if result.get("dry_run"):
+                                print("[自动交易] DRY-RUN 模拟成功")
                             else:
-                                print(f"[自动交易] 交易失败: {result.get('error', '未知错误')}")
+                                print("[自动交易] 交易成功！暂停30分钟")
+                                await asyncio.sleep(1800)  # 冷却30分钟
+                        else:
+                            print(f"[自动交易] 交易失败: {result.get('error', '未知错误')}")
 
-                await asyncio.sleep(REFRESH_INTERVAL)
+            await asyncio.sleep(REFRESH_INTERVAL)
 
-            except KeyboardInterrupt:
-                print("\n监控已停止")
-                break
-            except Exception as e:
-                print(f"[错误] {e}")
-                import traceback
-                traceback.print_exc()
-                await asyncio.sleep(REFRESH_INTERVAL)
+        except KeyboardInterrupt:
+            print("\n监控已停止")
+            break
+        except Exception as e:
+            print(f"[错误] {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(REFRESH_INTERVAL)
 
 
 # ============ 交易执行 ============
