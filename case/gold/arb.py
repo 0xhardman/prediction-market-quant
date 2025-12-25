@@ -12,6 +12,7 @@ Usage:
 
 import asyncio
 import json
+import math
 import signal
 import sys
 from dataclasses import dataclass
@@ -36,8 +37,7 @@ from src.utils.telegram import TelegramNotifier
 PM_MIN_ORDER_VALUE = 1.0  # PM minimum order value in USD
 
 # Configuration
-ARB_AMOUNT = 50  # USD per arbitrage
-MIN_PROFIT_THRESHOLD = 0.01  # 1% minimum profit
+MIN_PROFIT_THRESHOLD = 0.015  # 1% minimum profit
 CHECK_INTERVAL = 5  # seconds between checks
 PF_FEE_RATE = 1.02  # 2% fee on Predict.fun
 
@@ -242,7 +242,7 @@ async def execute_arbitrage(
 async def monitor_loop(market_config: MarketConfig):
     """Main monitoring loop with persistent client connections."""
     logger.info("Starting gold arbitrage monitor")
-    logger.info(f"Config: amount=${ARB_AMOUNT}, threshold={MIN_PROFIT_THRESHOLD:.1%}, interval={CHECK_INTERVAL}s")
+    logger.info(f"Config: threshold={MIN_PROFIT_THRESHOLD:.1%}, interval={CHECK_INTERVAL}s")
 
     # Load configs
     pf_config = PredictFunConfig.from_env()
@@ -278,7 +278,14 @@ async def monitor_loop(market_config: MarketConfig):
             await client.connect()
             logger.debug(f"PM client {i+1}/7 connected")
 
-        logger.info("All clients connected, starting monitor loop")
+        logger.info("All clients connected")
+
+        # Check initial balances
+        pf_balance = await pf_client.get_balance()
+        pm_balance = await pm_clients[0].get_balance()  # All PM clients share same wallet
+        logger.info(f"Balances: PF={pf_balance:.2f} USDT, PM={pm_balance:.2f} USDC")
+
+        logger.info("Starting monitor loop")
 
         # Monitor loop
         while True:
@@ -306,26 +313,44 @@ async def monitor_loop(market_config: MarketConfig):
                     else:
                         logger.info(f"ARBITRAGE FOUND! Profit: {opp.profit_rate:.2%}")
 
-                        # Use max_shares (maximize profit), capped by ARB_AMOUNT
-                        shares = min(opp.max_shares, ARB_AMOUNT / opp.total_cost)
-                        # Ensure above minimum
-                        shares = max(shares, opp.min_shares)
+                        # Use min_shares (ceiling) to minimize risk
+                        shares = math.ceil(opp.min_shares)
 
                         if shares > opp.max_shares:
-                            logger.warning(f"Cannot meet min_shares, skipping")
+                            logger.warning(f"min_shares({shares}) > max_shares({opp.max_shares:.1f}), skipping")
                         else:
                             total_usd = shares * opp.total_cost
+                            pf_needed = shares * opp.pf_no_ask * PF_FEE_RATE
+                            pm_needed = shares * pm_sum
+
+                            # Check balances before executing
+                            pf_balance = await pf_client.get_balance()
+                            pm_balance = await pm_clients[0].get_balance()
+
+                            if pf_balance < pf_needed:
+                                logger.warning(f"PF balance insufficient: {pf_balance:.2f} < {pf_needed:.2f}")
+                                await tg.send(f"<b>Arb Skipped</b>\nPF balance: ${pf_balance:.2f} < ${pf_needed:.2f}")
+                                await asyncio.sleep(CHECK_INTERVAL)
+                                continue
+
+                            if pm_balance < pm_needed:
+                                logger.warning(f"PM balance insufficient: {pm_balance:.2f} < {pm_needed:.2f}")
+                                await tg.send(f"<b>Arb Skipped</b>\nPM balance: ${pm_balance:.2f} < ${pm_needed:.2f}")
+                                await asyncio.sleep(CHECK_INTERVAL)
+                                continue
+
+                            # Calculate expected profit
+                            expected_profit = shares * opp.profit_rate
 
                             # Notify: arbitrage found
                             await tg.send(
                                 f"<b>Gold Arb Found</b>\n"
-                                f"Profit: {opp.profit_rate:.2%}\n"
-                                f"Shares: {shares:.1f} (${total_usd:.2f})\n"
-                                f"PF NO: {opp.pf_no_ask:.4f}\n"
-                                f"PM sum: {pm_sum:.4f}"
+                                f"Profit: {opp.profit_rate:.2%} (${expected_profit:.2f})\n"
+                                f"Shares: {shares} @ ${total_usd:.2f}\n"
+                                f"PF: ${pf_needed:.2f} | PM: ${pm_needed:.2f}"
                             )
 
-                            logger.info(f"Buying {shares:.2f} shares for ${total_usd:.2f}")
+                            logger.info(f"Buying {shares} shares for ${total_usd:.2f}, expected profit ${expected_profit:.2f}")
 
                             success = await execute_arbitrage(
                                 pf_client, pm_clients, market_config, shares
