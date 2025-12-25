@@ -44,6 +44,7 @@ class PredictFunClient(BaseClient):
         self,
         market_id: int,
         token_id: str,
+        is_yes: bool = True,
         config: PredictFunConfig | None = None,
     ):
         """Initialize Predict.fun client.
@@ -51,10 +52,13 @@ class PredictFunClient(BaseClient):
         Args:
             market_id: Market ID for orderbook queries.
             token_id: Token ID for order placement.
+            is_yes: True if this is a YES token, False for NO token.
+                    Affects orderbook interpretation since API only returns YES orderbook.
             config: Configuration object. If None, loads from environment.
         """
         self.market_id = market_id
         self.token_id = token_id
+        self.is_yes = is_yes
         self._config = config or PredictFunConfig.from_env()
         self._http: httpx.AsyncClient | None = None
         self._builder: OrderBuilder | None = None
@@ -159,7 +163,12 @@ class PredictFunClient(BaseClient):
             raise NotConnectedError("Client not connected. Call connect() first.")
 
     async def get_orderbook(self) -> Orderbook:
-        """Get orderbook for the bound market."""
+        """Get orderbook for the bound token.
+
+        Note: PF API only returns YES orderbook. For NO tokens, we convert:
+        - NO bids = YES asks (price -> 1-p)
+        - NO asks = YES bids (price -> 1-p)
+        """
         self._ensure_connected()
         await self._ensure_valid_token()
 
@@ -168,8 +177,17 @@ class PredictFunClient(BaseClient):
 
         book = resp.json().get("data", {})
         # PF format: [[price, size], ...]
-        bids = [(float(b[0]), float(b[1])) for b in book.get("bids", [])]
-        asks = [(float(a[0]), float(a[1])) for a in book.get("asks", [])]
+        yes_bids = [(float(b[0]), float(b[1])) for b in book.get("bids", [])]
+        yes_asks = [(float(a[0]), float(a[1])) for a in book.get("asks", [])]
+
+        if self.is_yes:
+            bids, asks = yes_bids, yes_asks
+        else:
+            # Convert YES orderbook to NO orderbook
+            # NO bids = YES asks with price 1-p
+            # NO asks = YES bids with price 1-p
+            bids = [(1 - price, size) for price, size in yes_asks]
+            asks = [(1 - price, size) for price, size in yes_bids]
 
         # Sort: bids descending (highest first), asks ascending (lowest first)
         bids.sort(key=lambda x: x[0], reverse=True)
