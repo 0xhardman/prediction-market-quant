@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import time
 
+from dotenv import load_dotenv
+
+# Load .env from project root
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
+
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -26,6 +31,7 @@ from src.clients.polymarket import PolymarketClient
 from src.config import PredictFunConfig, PolymarketConfig
 from src.models import Orderbook, Side
 from src.logging import get_logger
+from src.utils.telegram import TelegramNotifier
 
 PM_MIN_ORDER_VALUE = 1.0  # PM minimum order value in USD
 
@@ -242,6 +248,13 @@ async def monitor_loop(market_config: MarketConfig):
     pf_config = PredictFunConfig.from_env()
     pm_config = PolymarketConfig.from_env()
 
+    # Create TG notifier
+    tg = TelegramNotifier()
+    if tg.is_configured:
+        logger.info("Telegram notifications enabled")
+    else:
+        logger.info("Telegram not configured, notifications disabled")
+
     # Create and connect all clients
     pf_client = PredictFunClient(
         market_id=market_config.pf_market_id,
@@ -302,6 +315,16 @@ async def monitor_loop(market_config: MarketConfig):
                             logger.warning(f"Cannot meet min_shares, skipping")
                         else:
                             total_usd = shares * opp.total_cost
+
+                            # Notify: arbitrage found
+                            await tg.send(
+                                f"<b>Gold Arb Found</b>\n"
+                                f"Profit: {opp.profit_rate:.2%}\n"
+                                f"Shares: {shares:.1f} (${total_usd:.2f})\n"
+                                f"PF NO: {opp.pf_no_ask:.4f}\n"
+                                f"PM sum: {pm_sum:.4f}"
+                            )
+
                             logger.info(f"Buying {shares:.2f} shares for ${total_usd:.2f}")
 
                             success = await execute_arbitrage(
@@ -309,14 +332,17 @@ async def monitor_loop(market_config: MarketConfig):
                             )
                             if success:
                                 logger.info("Arbitrage executed successfully!")
+                                await tg.send(f"<b>Arb Executed</b>\n{shares:.1f} shares @ ${total_usd:.2f}")
                             else:
                                 logger.warning("Arbitrage execution had some failures")
+                                await tg.send(f"<b>Arb Failed</b>\nSome orders failed")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
     finally:
         # Cleanup
         logger.info("Closing connections...")
+        await tg.close()
         await pf_client.close()
         for client in pm_clients:
             await client.close()
