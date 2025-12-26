@@ -422,25 +422,50 @@ async def execute_arbitrage(
         f"PM order: token_id={pm_client.token_id[:20]}..., shares={shares}"
     )
 
-    # Place PF order
-    try:
-        order = await pf_client.place_market_order(
-            Side.BUY, size=shares, token_id=pf_token_id, is_yes=pf_is_yes
-        )
-        logger.info(f"PF order placed: {order.id[:30]}...")
-    except Exception as e:
-        logger.error(f"Failed to place PF order: {e}")
-        success = False
+    # Place orders in parallel
+    pf_task = pf_client.place_market_order(
+        Side.BUY, size=shares, token_id=pf_token_id, is_yes=pf_is_yes
+    )
+    pm_task = pm_client.place_market_order(Side.BUY, size=shares)
 
-    # Place PM order
-    try:
-        order = await pm_client.place_market_order(Side.BUY, size=shares)
-        logger.info(f"PM order placed: {order.id[:30]}...")
-    except Exception as e:
-        logger.error(f"Failed to place PM order: {e}")
-        success = False
+    results = await asyncio.gather(pf_task, pm_task, return_exceptions=True)
+    pf_result, pm_result = results
 
-    return success
+    pf_success = not isinstance(pf_result, Exception)
+    pm_success = not isinstance(pm_result, Exception)
+
+    if pf_success:
+        logger.info(f"PF order placed: {pf_result.id[:30]}...")
+    else:
+        logger.error(f"Failed to place PF order: {pf_result}")
+
+    if pm_success:
+        logger.info(f"PM order placed: {pm_result.id[:30]}...")
+    else:
+        logger.error(f"Failed to place PM order: {pm_result}")
+
+    # Handle partial success - close the successful side
+    if pf_success and not pm_success:
+        logger.warning("PM failed, closing PF position...")
+        try:
+            await pf_client.place_market_order(
+                Side.SELL, size=shares, token_id=pf_token_id, is_yes=pf_is_yes
+            )
+            logger.info("PF position closed")
+        except Exception as e:
+            logger.error(f"Failed to close PF position: {e}")
+        return False
+
+    if pm_success and not pf_success:
+        logger.warning("PF failed, closing PM position...")
+        try:
+            await pm_client.place_market_order(Side.SELL, size=shares)
+            logger.info("PM position closed")
+        except Exception as e:
+            logger.error(f"Failed to close PM position: {e}")
+        return False
+
+    return pf_success and pm_success
 
 
 async def monitor_loop(game_config: GameConfig):

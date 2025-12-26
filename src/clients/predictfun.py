@@ -63,6 +63,9 @@ class PredictFunClient(BaseClient):
         self._http: httpx.AsyncClient | None = None
         self._builder: OrderBuilder | None = None
         self._jwt_expires_at: float = 0  # Unix timestamp when JWT expires
+        # Market properties for signing (fetched on connect)
+        self._is_neg_risk: bool = False
+        self._is_yield_bearing: bool = False
 
     @property
     def is_connected(self) -> bool:
@@ -104,6 +107,25 @@ class PredictFunClient(BaseClient):
 
         logger.info("JWT token obtained successfully")
 
+    async def _fetch_market_properties(self) -> None:
+        """Fetch market properties (isNegRisk, isYieldBearing) for signing."""
+        try:
+            resp = await self._http.get(f"/markets/{self.market_id}")
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("success"):
+                market = data.get("data", {})
+                self._is_neg_risk = market.get("isNegRisk", False)
+                self._is_yield_bearing = market.get("isYieldBearing", False)
+                logger.info(
+                    f"Market {self.market_id}: isNegRisk={self._is_neg_risk}, "
+                    f"isYieldBearing={self._is_yield_bearing}"
+                )
+            else:
+                logger.warning(f"Failed to fetch market properties: {data}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch market properties: {e}")
+
     async def _ensure_valid_token(self) -> None:
         """Refresh JWT if expired or about to expire."""
         if time() >= self._jwt_expires_at:
@@ -137,6 +159,9 @@ class PredictFunClient(BaseClient):
 
             # Authenticate
             await self._authenticate()
+
+            # Fetch market properties for signing
+            await self._fetch_market_properties()
 
             logger.info("Connected to Predict.fun successfully")
 
@@ -233,9 +258,9 @@ class PredictFunClient(BaseClient):
             ),
         )
 
-        # Sign order
+        # Sign order with correct market properties
         typed_data = self._builder.build_typed_data(
-            order, is_neg_risk=False, is_yield_bearing=False
+            order, is_neg_risk=self._is_neg_risk, is_yield_bearing=self._is_yield_bearing
         )
         order_hash = self._builder.build_typed_data_hash(typed_data)
         signed = self._builder.sign_typed_data_order(typed_data)
@@ -501,9 +526,9 @@ class PredictFunClient(BaseClient):
             ),
         )
 
-        # Sign order
+        # Sign order with correct market properties
         typed_data = self._builder.build_typed_data(
-            order, is_neg_risk=False, is_yield_bearing=False
+            order, is_neg_risk=self._is_neg_risk, is_yield_bearing=self._is_yield_bearing
         )
         order_hash = self._builder.build_typed_data_hash(typed_data)
         signed = self._builder.sign_typed_data_order(typed_data)
