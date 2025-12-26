@@ -152,17 +152,25 @@ async def check_arbitrage(
 ) -> ArbOpportunity | None:
     """Check for arbitrage opportunity using connected clients."""
     try:
-        # Fetch all orderbooks concurrently
+        # Fetch all orderbooks with timeout
         tasks = [pf_client.get_orderbook()]
         for client in pm_clients:
             tasks.append(client.get_orderbook())
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Orderbook fetch timeout (15s)")
+            return None
 
         # Check for errors
+        names = ["PF"] + [m["title"] for m in market_config.pm_markets]
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error(f"Failed to fetch orderbook {i}: {result}")
+                logger.error(f"Failed to fetch {names[i]}: {type(result).__name__}: {result}")
                 return None
 
         # Extract orderbooks
