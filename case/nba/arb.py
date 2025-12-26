@@ -265,7 +265,7 @@ async def check_arbitrage(
             cost2 = pf_a_no_ask * PF_FEE_RATE + pm_a_yes_ask
             profit2 = 1 - cost2
 
-            # Log only 2 directions (Team B is symmetric)
+            # Log Team A directions
             logger.info(
                 f"PF_YES({game_config.team_a})+PM_YES({game_config.team_b}): "
                 f"{pf_a_yes_ask:.2f}*1.02+{pm_a_no_ask:.2f}={cost1:.3f} -> {profit1:+.2%}"
@@ -329,6 +329,16 @@ async def check_arbitrage(
             # Direction 2: PF NO + PM YES
             cost2 = pf_b_no_ask * PF_FEE_RATE + pm_b_yes_ask
             profit2 = 1 - cost2
+
+            # Log Team B directions
+            logger.info(
+                f"PF_YES({game_config.team_b})+PM_YES({game_config.team_a}): "
+                f"{pf_b_yes_ask:.2f}*1.02+{pm_b_no_ask:.2f}={cost1:.3f} -> {profit1:+.2%}"
+            )
+            logger.info(
+                f"PF_NO({game_config.team_b})+PM_YES({game_config.team_b}): "
+                f"{pf_b_no_ask:.2f}*1.02+{pm_b_yes_ask:.2f}={cost2:.3f} -> {profit2:+.2%}"
+            )
 
             if profit1 > best_profit:
                 min_price = min(pf_b_yes_ask, pm_b_no_ask)
