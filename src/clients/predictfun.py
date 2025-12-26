@@ -291,9 +291,15 @@ class PredictFunClient(BaseClient):
             error_msg = result.get("message", "") or result.get("error", {}).get(
                 "description", ""
             )
-            # Log full response for debugging
-            logger.error(f"Order placement failed: {error_msg}")
-            logger.debug(f"Full response: {result}")
+            # Detailed debug logging
+            logger.error(f"Limit order failed: {error_msg}")
+            logger.error(f"Status code: {resp.status_code}")
+            logger.error(f"Full response: {result}")
+            logger.error(
+                f"Order params: token_id={self.token_id}, side={side.value}, "
+                f"price={price}, size={size}, "
+                f"maker_amount={amounts.maker_amount}, taker_amount={amounts.taker_amount}"
+            )
             error_lower = error_msg.lower()
             if "insufficient" in error_lower or "collateral" in error_lower:
                 raise InsufficientBalanceError()

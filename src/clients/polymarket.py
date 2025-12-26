@@ -169,7 +169,11 @@ class PolymarketClient(BaseClient):
             resp = await asyncio.to_thread(self._client.post_order, signed_order, order_type)
         except Exception as e:
             error_msg = str(e).lower()
-            logger.error(f"Order placement failed: {e}")
+            logger.error(f"Limit order failed: {e}")
+            logger.error(
+                f"Order params: token_id={self.token_id[:20]}..., side={side.value}, "
+                f"price={price}, size={size}, order_type={order_type}"
+            )
             if "insufficient" in error_msg or "balance" in error_msg:
                 raise InsufficientBalanceError() from e
             raise OrderRejectedError(str(e)) from e
@@ -347,6 +351,10 @@ class PolymarketClient(BaseClient):
         except Exception as e:
             error_msg = str(e).lower()
             logger.error(f"Market order failed: {e}")
+            logger.error(
+                f"Order params: token_id={self.token_id[:20]}..., side={side.value}, "
+                f"amount={amount}, size={size}, value={value}"
+            )
             if "insufficient" in error_msg or "balance" in error_msg:
                 raise InsufficientBalanceError() from e
             raise OrderRejectedError(str(e)) from e

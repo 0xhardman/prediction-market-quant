@@ -414,6 +414,14 @@ async def execute_arbitrage(
         pf_is_yes = False
         pm_client = clients["pm_team_a"] if is_team_a else clients["pm_team_b"]
 
+    # Log order details before placing
+    logger.info(
+        f"PF order: token_id={pf_token_id[:20]}..., is_yes={pf_is_yes}, shares={shares}"
+    )
+    logger.info(
+        f"PM order: token_id={pm_client.token_id[:20]}..., shares={shares}"
+    )
+
     # Place PF order
     try:
         order = await pf_client.place_market_order(
