@@ -221,30 +221,81 @@ async def execute_arbitrage(
     market_config: MarketConfig,
     shares: float,
 ) -> bool:
-    """Execute arbitrage by placing market orders on all 8 markets."""
+    """Execute arbitrage by placing market orders on all 8 markets in parallel."""
     logger.info(f"Executing arbitrage: {shares:.2f} shares")
 
-    success = True
-
-    # Place PF NO order
-    try:
-        order = await pf_client.place_market_order(Side.BUY, size=shares)
-        logger.info(f"PF NO order placed: {order.id[:30]}...")
-    except Exception as e:
-        logger.error(f"Failed to place PF NO order: {e}")
-        success = False
-
-    # Place PM YES orders
+    # Log order details
+    logger.info(f"PF order: token_id={market_config.pf_no_token_id[:20]}..., shares={shares}")
     for i, client in enumerate(pm_clients):
         title = market_config.pm_markets[i]["title"]
-        try:
-            order = await client.place_market_order(Side.BUY, size=shares)
-            logger.info(f"PM {title} YES order placed: {order.id[:30]}...")
-        except Exception as e:
-            logger.error(f"Failed to place PM {title} order: {e}")
-            success = False
+        logger.info(f"PM {title} order: token_id={client.token_id[:20]}..., shares={shares}")
 
-    return success
+    # Create all tasks
+    pf_task = pf_client.place_market_order(Side.BUY, size=shares)
+    pm_tasks = [client.place_market_order(Side.BUY, size=shares) for client in pm_clients]
+
+    # Execute all orders in parallel
+    all_tasks = [pf_task] + pm_tasks
+    results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    pf_result = results[0]
+    pm_results = results[1:]
+
+    # Check results
+    pf_success = not isinstance(pf_result, Exception)
+    pm_successes = [not isinstance(r, Exception) for r in pm_results]
+
+    if pf_success:
+        logger.info(f"PF NO order placed: {pf_result.id[:30]}...")
+    else:
+        logger.error(f"Failed to place PF NO order: {pf_result}")
+
+    for i, (success, result) in enumerate(zip(pm_successes, pm_results)):
+        title = market_config.pm_markets[i]["title"]
+        if success:
+            logger.info(f"PM {title} YES order placed: {result.id[:30]}...")
+        else:
+            logger.error(f"Failed to place PM {title} order: {result}")
+
+    # Handle partial success - close successful positions
+    all_pm_success = all(pm_successes)
+    any_pm_success = any(pm_successes)
+
+    if pf_success and not all_pm_success:
+        # Some PM orders failed, close PF position
+        logger.warning("Some PM orders failed, closing PF position...")
+        try:
+            await pf_client.place_market_order(Side.SELL, size=shares)
+            logger.info("PF position closed")
+        except Exception as e:
+            logger.error(f"Failed to close PF position: {e}")
+
+        # Also close successful PM positions
+        for i, (success, client) in enumerate(zip(pm_successes, pm_clients)):
+            if success:
+                title = market_config.pm_markets[i]["title"]
+                logger.warning(f"Closing PM {title} position...")
+                try:
+                    await client.place_market_order(Side.SELL, size=shares)
+                    logger.info(f"PM {title} position closed")
+                except Exception as e:
+                    logger.error(f"Failed to close PM {title} position: {e}")
+        return False
+
+    if not pf_success and any_pm_success:
+        # PF failed, close all successful PM positions
+        logger.warning("PF order failed, closing PM positions...")
+        for i, (success, client) in enumerate(zip(pm_successes, pm_clients)):
+            if success:
+                title = market_config.pm_markets[i]["title"]
+                try:
+                    await client.place_market_order(Side.SELL, size=shares)
+                    logger.info(f"PM {title} position closed")
+                except Exception as e:
+                    logger.error(f"Failed to close PM {title} position: {e}")
+        return False
+
+    return pf_success and all_pm_success
 
 
 async def monitor_loop(market_config: MarketConfig):
